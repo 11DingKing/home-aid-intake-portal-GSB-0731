@@ -1,0 +1,16 @@
+{
+  "states": ["DRAFT", "SUBMITTED", "NEEDS_CORRECTION", "RESUBMITTED", "ACCEPTED", "DECLINED"],
+  "exemptionReasons": ["NO_FIXED_INCOME", "NOTIFIED_CRIMINAL_DEFENSE", "NONE"],
+  "accommodations": ["HOME_VISIT_NEEDED", "SIGN_INTERPRETER", "TEXT_ONLY", "BRAILLE_MATERIAL"],
+  "applications": [
+    {"id": "APP-201", "reason": "NO_FIXED_INCOME", "economicProof": null, "otherRequiredMaterial": "ID-META-1", "accommodations": ["HOME_VISIT_NEEDED"]},
+    {"id": "APP-202", "reason": "NONE", "economicProof": null, "otherRequiredMaterial": "ID-META-2", "accommodations": ["TEXT_ONLY"]}
+  ],
+  "corrections": [{"applicationId": "APP-202", "fields": ["economicProof"], "reasonCode": "ECONOMIC_PROOF_REQUIRED"}],
+  "staffViews": {
+    "INTAKE_REVIEW": ["id", "state", "exemptionReason", "materialMetadata", "accommodations"],
+    "CORRECTION_REVIEW": ["id", "state", "correctionFields", "submittedFieldMetadata"]
+  },
+  "offlineConflicts": ["same base version with different field edits", "server accepted while client remains draft", "duplicate submit with same idempotency key"]
+}
+
