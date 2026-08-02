@@ -7,3 +7,9 @@ prisma/*.db
 .env*
 !.env.example
 
+# test + build artifacts
+/test-results/
+/playwright-report/
+/playwright/.cache/
+next-env.d.ts.bak
+tsconfig.tsbuildinfo

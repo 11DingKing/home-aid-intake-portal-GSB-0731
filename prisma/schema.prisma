@@ -1,0 +1,121 @@
+// Home Aid Intake Portal — legal-aid pre-application persistence.
+//
+// SQLite has no native enum type, so enum-like columns are stored as TEXT and
+// constrained by the domain layer (Zod unions in src/domain). Field-level draft
+// merging is powered by ApplicationField.updatedAtVersion: every editable field
+// records the application version at which it last changed, which lets two
+// offline sessions editing *different* fields from the same base version both
+// converge, while two edits to the *same* field surface a conflict.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Application {
+  id        String   @id
+  // State machine value: DRAFT | SUBMITTED | NEEDS_CORRECTION | RESUBMITTED | ACCEPTED | DECLINED
+  state     String   @default("DRAFT")
+  // Optimistic concurrency version for the whole application. Bumped once per
+  // accepted write (draft patch, submit, correction, staff decision).
+  version   Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  fields      ApplicationField[]
+  materials   MaterialMetadata[]
+  corrections Correction[]
+  events      ApplicationEvent[]
+  idempotency IdempotencyKey[]
+
+  @@index([state])
+}
+
+model ApplicationField {
+  id            String   @id @default(cuid())
+  applicationId String
+  // Field key, e.g. fullName, exemptionReason, accommodations, economicProof.
+  key           String
+  // Serialized value. Scalars stored as text; multi-value fields (accommodations)
+  // stored as a JSON-encoded string. Absent/cleared value stored as NULL.
+  value         String?
+  // Application.version at which this field was last written. Enables field-level
+  // conflict detection during offline draft reconciliation.
+  updatedAtVersion Int   @default(0)
+  updatedAt     DateTime @updatedAt
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@unique([applicationId, key])
+  @@index([applicationId])
+}
+
+model MaterialMetadata {
+  // Metadata only — never the file bytes. This is what the staff intake view is
+  // permitted to see for uploaded materials.
+  id            String   @id
+  applicationId String?
+  // Logical kind, e.g. ECONOMIC_PROOF | IDENTITY | OTHER.
+  kind          String
+  filename      String
+  mimeType      String
+  sizeBytes     Int
+  checksum      String?
+  uploadedAt    DateTime @default(now())
+
+  application Application? @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+
+  @@index([applicationId])
+}
+
+model Correction {
+  id            String   @id @default(cuid())
+  applicationId String
+  // JSON-encoded array of field keys the applicant must correct.
+  fields        String
+  reasonCode    String
+  note          String?
+  // Open until the applicant resubmits; resolvedAt is set on RESUBMITTED.
+  createdAt     DateTime @default(now())
+  resolvedAt    DateTime?
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+}
+
+model ApplicationEvent {
+  id            String   @id @default(cuid())
+  applicationId String
+  // State transition audit: previous -> next.
+  fromState     String?
+  toState       String
+  actor         String // "applicant" | "staff" | "system"
+  note          String?
+  createdAt     DateTime @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+}
+
+model IdempotencyKey {
+  // Guards duplicate final submissions: the same key replays the original
+  // outcome instead of performing a second state transition.
+  key           String   @id
+  applicationId String
+  scope         String // e.g. "submit" | "resubmit"
+  requestHash   String
+  resultState   String
+  resultVersion Int
+  createdAt     DateTime @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+}
