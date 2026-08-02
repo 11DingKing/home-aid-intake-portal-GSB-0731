@@ -40,12 +40,13 @@ export async function PATCH(
       return edit;
     });
 
-    const result = await patchDraft(id, parsed.baseVersion, edits);
-    // 200 with conflicts array; client reconciles field-by-field.
+    const result = await patchDraft(id, parsed.baseVersion, edits, parsed.step);
+    // 200 with conflicts + denied arrays; client reconciles field-by-field.
     return ok({
       application: result.application,
       applied: result.applied.map(summarize),
       conflicts: result.conflicts.map(summarize),
+      denied: result.denied,
     });
   } catch (err) {
     return errorResponse(err);

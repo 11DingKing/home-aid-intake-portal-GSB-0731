@@ -1,23 +1,11 @@
 import Link from "next/link";
-import { getStaffView } from "@/server/applicationService";
+import { getStaffContinuation } from "@/server/applicationService";
 import { prisma } from "@/server/db";
 import { STAFF_VIEWS, isApplicationState, type StaffViewName } from "@/domain/constants";
 import StatusBadge from "@/components/StatusBadge";
 import StaffActions from "./StaffActions";
-import type { ApplicationState } from "@/domain/constants";
 
 export const dynamic = "force-dynamic";
-
-// Choose the disclosure view from the application state:
-//  - NEEDS_CORRECTION / RESUBMITTED -> CORRECTION_REVIEW (correction fields +
-//    submitted-field metadata only)
-//  - otherwise -> INTAKE_REVIEW (exemption reason, material metadata,
-//    accommodations)
-// The staff surface NEVER receives fields outside the active view.
-function viewForState(state: ApplicationState): StaffViewName {
-  if (state === "NEEDS_CORRECTION" || state === "RESUBMITTED") return "CORRECTION_REVIEW";
-  return "INTAKE_REVIEW";
-}
 
 export default async function StaffDetailPage({
   params,
@@ -45,9 +33,12 @@ export default async function StaffDetailPage({
   }
 
   const state = isApplicationState(app.state) ? app.state : "DRAFT";
-  const view: StaffViewName =
-    viewParam && viewParam in STAFF_VIEWS ? (viewParam as StaffViewName) : viewForState(state);
-  const disclosed = (await getStaffView(id, view)) as Record<string, unknown>;
+  // Server recomputes the disclosure view from the CURRENT state — a stale
+  // `?view=` link can never widen disclosure in the rendered HTML. Over-privileged
+  // fields are never projected, so they cannot appear in the markup at all.
+  const continuation = await getStaffContinuation(id, viewParam ?? null);
+  const view = continuation.enforcedView;
+  const disclosed = continuation.disclosed;
   const allowedKeys = STAFF_VIEWS[view] as readonly string[];
 
   return (
@@ -59,6 +50,15 @@ export default async function StaffDetailPage({
         <h1 id="sd-heading">Continue application {id}</h1>
         <StatusBadge state={state} />
       </div>
+
+      {continuation.downgraded ? (
+        <div className="banner" data-tone="warn" role="status" data-testid="stale-view-notice">
+          <span className="banner-title">View adjusted: </span>
+          This link requested the <strong>{continuation.requestedView}</strong> view, but the
+          application is now <strong>{state}</strong>. You are seeing the
+          state-appropriate <strong>{view}</strong> view; the change is recorded in the audit trail.
+        </div>
+      ) : null}
 
       <div className="banner" data-tone="info" role="note" data-testid="disclosure-note">
         <span className="banner-title">Minimal disclosure: </span>

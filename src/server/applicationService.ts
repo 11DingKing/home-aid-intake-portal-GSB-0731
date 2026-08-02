@@ -8,6 +8,7 @@ import {
 } from "./fieldSerialization";
 import {
   APPLICANT_FIELD_KEYS,
+  STAFF_VIEWS,
   type ApplicantFieldKey,
   type ApplicationState,
   type MaterialKind,
@@ -35,6 +36,16 @@ import {
   type FullApplicationProjection,
   type MaterialMetadataView,
 } from "@/domain/disclosure";
+import {
+  applicantFieldPolicy,
+  staffStepForState,
+  coerceApplicantStep,
+  evaluateWrites,
+  APPLICANT_PII_FIELDS,
+  type ActorRole,
+  type ApplicantStep,
+  type WriteDecision,
+} from "@/domain/accessPolicy";
 
 // ---------------------------------------------------------------------------
 // Public DTOs
@@ -114,6 +125,80 @@ async function reloadWithinTx(tx: TxClient, id: string): Promise<ApplicationView
     },
   });
   return assembleView(app);
+}
+
+// ---------------------------------------------------------------------------
+// Audit trail — every field-level access decision (read + write) is recorded so
+// an over-privileged read or a crafted hidden-field submit is always explainable.
+// ---------------------------------------------------------------------------
+
+export type AuditDecision = "ALLOW" | "DENY" | "PARTIAL";
+
+interface AuditInput {
+  applicationId: string;
+  actorRole: ActorRole | "system";
+  action: string;
+  decision: AuditDecision;
+  state: ApplicationState;
+  atVersion: number;
+  allowedFields: string[];
+  deniedFields: string[];
+  reasonCode?: string | null;
+  note?: string | null;
+}
+
+async function writeAudit(
+  db: TxClient | typeof prisma,
+  input: AuditInput,
+): Promise<void> {
+  await db.auditLog.create({
+    data: {
+      applicationId: input.applicationId,
+      actorRole: input.actorRole,
+      action: input.action,
+      decision: input.decision,
+      state: input.state,
+      atVersion: input.atVersion,
+      allowedFields: JSON.stringify(input.allowedFields),
+      deniedFields: JSON.stringify(input.deniedFields),
+      reasonCode: input.reasonCode ?? null,
+      note: input.note ?? null,
+    },
+  });
+}
+
+export interface AuditEntry {
+  id: string;
+  actorRole: string;
+  action: string;
+  decision: string;
+  state: string;
+  atVersion: number;
+  allowedFields: string[];
+  deniedFields: string[];
+  reasonCode: string | null;
+  note: string | null;
+  createdAt: string;
+}
+
+export async function getAuditTrail(id: string): Promise<AuditEntry[]> {
+  const rows = await prisma.auditLog.findMany({
+    where: { applicationId: id },
+    orderBy: { createdAt: "asc" },
+  });
+  return rows.map((r) => ({
+    id: r.id,
+    actorRole: r.actorRole,
+    action: r.action,
+    decision: r.decision,
+    state: r.state,
+    atVersion: r.atVersion,
+    allowedFields: safeParseStringArray(r.allowedFields),
+    deniedFields: safeParseStringArray(r.deniedFields),
+    reasonCode: r.reasonCode,
+    note: r.note,
+    createdAt: r.createdAt.toISOString(),
+  }));
 }
 
 type LoadedApp = {
@@ -204,17 +289,54 @@ export async function getApplication(id: string): Promise<ApplicationView> {
 
 // ------- Draft patch (field-level merge) -----------------------------------
 
+export interface DeniedField {
+  key: string;
+  reasonCode: string;
+}
+
 export interface DraftPatchResult {
   application: ApplicationView;
   applied: FieldMergeResult[];
   conflicts: FieldMergeResult[];
+  // Fields the server refused to write (unknown / over-privileged / not in the
+  // step whitelist). Each carries an auditable reason. These are dropped BEFORE
+  // the merge, so a crafted hidden field can never reach persistence.
+  denied: DeniedField[];
 }
 
 export async function patchDraft(
   id: string,
   baseVersion: number,
   edits: IncomingEdit[],
+  step: ApplicantStep = "review",
 ): Promise<DraftPatchResult> {
+  // Pre-check editability OUTSIDE the transaction so the deny audit is not rolled
+  // back together with the rejected write. A crafted write against a locked state
+  // must still leave an auditable record.
+  const pre = await prisma.application.findUnique({
+    where: { id },
+    select: { state: true, version: true },
+  });
+  if (!pre) throw notFound();
+  const preState = isApplicationState(pre.state) ? pre.state : "DRAFT";
+  if (!canEditFields(preState)) {
+    await writeAudit(prisma, {
+      applicationId: id,
+      actorRole: "applicant",
+      action: "draft.write",
+      decision: "DENY",
+      state: preState,
+      atVersion: pre.version,
+      allowedFields: [],
+      deniedFields: edits.map((e) => String(e.key)),
+      reasonCode: "NOT_WRITABLE_IN_STATE",
+      note: `Draft not editable in state ${preState}.`,
+    });
+    throw new AppError("NOT_EDITABLE", `Draft is not editable in state ${preState}.`, 409, {
+      state: preState,
+    });
+  }
+
   return prisma.$transaction(async (tx) => {
     const app = await tx.application.findUnique({
       where: { id },
@@ -223,13 +345,39 @@ export async function patchDraft(
     if (!app) throw notFound();
     const state = isApplicationState(app.state) ? app.state : "DRAFT";
     if (!canEditFields(state)) {
+      // State flipped between the pre-check and the transaction (race). Audit is
+      // written on its own connection so it survives the rollback.
+      await writeAudit(prisma, {
+        applicationId: id,
+        actorRole: "applicant",
+        action: "draft.write",
+        decision: "DENY",
+        state,
+        atVersion: app.version,
+        allowedFields: [],
+        deniedFields: edits.map((e) => String(e.key)),
+        reasonCode: "NOT_WRITABLE_IN_STATE",
+        note: `Draft not editable in state ${state}.`,
+      });
       throw new AppError("NOT_EDITABLE", `Draft is not editable in state ${state}.`, 409, {
         state,
       });
     }
 
+    // Server-authoritative write policy: recompute the writable whitelist from
+    // (role, state, step) and classify every requested key. Never trust the
+    // client to have sent only permitted fields.
+    const policy = applicantFieldPolicy(state, step);
+    const evaluation = evaluateWrites(policy, edits.map((e) => String(e.key)));
+    const allowedSet = new Set<string>(evaluation.allowedKeys);
+    const permittedEdits = edits.filter((e) => allowedSet.has(String(e.key)));
+    const denied: DeniedField[] = evaluation.denied.map((d: WriteDecision) => ({
+      key: d.key,
+      reasonCode: d.reasonCode ?? "DENIED",
+    }));
+
     const storedMap = toFieldMap(app.fields);
-    const outcome = mergeFields(storedMap, edits);
+    const outcome = mergeFields(storedMap, permittedEdits);
 
     // Only bump the version + persist if at least one field actually changed.
     const toApply = outcome.applied;
@@ -255,6 +403,23 @@ export async function patchDraft(
       });
     }
 
+    // Record the field-level access decision for this write.
+    await writeAudit(tx, {
+      applicationId: id,
+      actorRole: "applicant",
+      action: "draft.write",
+      decision: denied.length === 0 ? "ALLOW" : toApply.length > 0 ? "PARTIAL" : "DENY",
+      state,
+      atVersion: newVersion,
+      allowedFields: toApply.map((r) => r.key),
+      deniedFields: denied.map((d) => d.key),
+      reasonCode: denied[0]?.reasonCode ?? null,
+      note:
+        denied.length > 0
+          ? `Rejected ${denied.length} over-privileged/unknown field(s) on step '${step}'.`
+          : null,
+    });
+
     const reloaded = await tx.application.findUniqueOrThrow({
       where: { id },
       include: {
@@ -267,6 +432,7 @@ export async function patchDraft(
       application: assembleView(reloaded),
       applied: outcome.applied,
       conflicts: outcome.conflicts,
+      denied,
     };
   });
 }
@@ -566,6 +732,174 @@ export async function getStaffView(id: string, view: StaffViewName) {
   };
 
   return projectForStaff(view, full);
+}
+
+// Map the policy staff step to the disclosure view name from the source material.
+const STAFF_STEP_TO_VIEW: Record<"intake" | "correction", StaffViewName> = {
+  intake: "INTAKE_REVIEW",
+  correction: "CORRECTION_REVIEW",
+};
+
+export interface StaffContinuation {
+  disclosed: Record<string, unknown>;
+  // The view the server ACTUALLY served, recomputed from current state.
+  enforcedView: StaffViewName;
+  // What the (possibly stale) link requested, for transparency.
+  requestedView: StaffViewName | null;
+  // True when a stale/broader link was downgraded to the state-appropriate view.
+  downgraded: boolean;
+  state: ApplicationState;
+  version: number;
+}
+
+/**
+ * Server-authoritative staff continuation read. The disclosure view is
+ * recomputed from the CURRENT state — a stale link (e.g. opened at the
+ * NEEDS_CORRECTION <-> RESUBMITTED boundary) can never widen disclosure beyond
+ * what the current state permits. Every read is audited; a downgrade records the
+ * over-privileged fields that were refused with a reason code. PII is stripped
+ * defensively as a second line of defense.
+ */
+export async function getStaffContinuation(
+  id: string,
+  requestedView?: string | null,
+): Promise<StaffContinuation> {
+  const app = await prisma.application.findUnique({ where: { id }, select: { state: true, version: true } });
+  if (!app) throw notFound();
+  const state = isApplicationState(app.state) ? app.state : "DRAFT";
+
+  const enforcedView = STAFF_STEP_TO_VIEW[staffStepForState(state)];
+  // Normalize the (possibly stale/crafted) requested view to a known name or null.
+  const normalizedRequested: StaffViewName | null =
+    requestedView === "INTAKE_REVIEW" || requestedView === "CORRECTION_REVIEW"
+      ? requestedView
+      : null;
+  const downgraded = normalizedRequested !== null && normalizedRequested !== enforcedView;
+
+  // Project using the ENFORCED view only (never the requested one).
+  const disclosed = (await getStaffView(id, enforcedView)) as Record<string, unknown>;
+
+  // Defensive PII strip: guarantee no applicant PII ever appears, regardless of
+  // how the projection was configured.
+  for (const pii of APPLICANT_PII_FIELDS) {
+    if (pii in disclosed) delete disclosed[pii];
+  }
+
+  // Audit the read decision. A downgrade is a PARTIAL/deny of the fields the
+  // broader requested view would have exposed.
+  if (downgraded && normalizedRequested) {
+    const requestedFields = (STAFF_VIEWS[normalizedRequested] as readonly string[]).slice();
+    const enforcedFields = new Set(STAFF_VIEWS[enforcedView] as readonly string[]);
+    const refused = requestedFields.filter((f) => !enforcedFields.has(f));
+    await writeAudit(prisma, {
+      applicationId: id,
+      actorRole: "staff",
+      action: "continuation.read",
+      decision: "PARTIAL",
+      state,
+      atVersion: app.version,
+      allowedFields: [...enforcedFields],
+      deniedFields: refused,
+      reasonCode: "STALE_VIEW_DOWNGRADED",
+      note: `Stale link requested ${normalizedRequested}; served ${enforcedView} for state ${state}.`,
+    });
+  } else {
+    await writeAudit(prisma, {
+      applicationId: id,
+      actorRole: "staff",
+      action: "continuation.read",
+      decision: "ALLOW",
+      state,
+      atVersion: app.version,
+      allowedFields: STAFF_VIEWS[enforcedView] as unknown as string[],
+      deniedFields: [],
+      reasonCode: null,
+      note: null,
+    });
+  }
+
+  return {
+    disclosed,
+    enforcedView,
+    requestedView: normalizedRequested,
+    downgraded,
+    state,
+    version: app.version,
+  };
+}
+
+// ------- Applicant step-scoped continuation (server-recomputed) ------------
+
+export interface ApplicantContinuation {
+  id: string;
+  state: ApplicationState;
+  version: number;
+  step: ApplicantStep;
+  // Only the values the current step is allowed to READ (recomputed server-side).
+  fields: Record<string, { value: StoredValue; updatedAtVersion: number }>;
+  // Field keys the current step may WRITE (recomputed server-side).
+  writable: string[];
+  openCorrection: { fields: string[]; reasonCode: string; note: string | null } | null;
+}
+
+/**
+ * Applicant continuation read scoped to a single step. The readable field set is
+ * recomputed from (state, step) on every load; fields the step does not own are
+ * never included in the payload (not merely hidden). Accommodation values are
+ * always returned on their step so the applicant can see/keep their request.
+ */
+export async function getApplicantContinuation(
+  id: string,
+  step: string,
+): Promise<ApplicantContinuation> {
+  const app = await prisma.application.findUnique({
+    where: { id },
+    include: {
+      fields: true,
+      corrections: { where: { resolvedAt: null }, orderBy: { createdAt: "desc" } },
+    },
+  });
+  if (!app) throw notFound();
+  const state = isApplicationState(app.state) ? app.state : "DRAFT";
+  const resolvedStep = coerceApplicantStep(step);
+  const policy = applicantFieldPolicy(state, resolvedStep);
+
+  const fieldMap = toFieldMap(app.fields);
+  const readable = new Set<string>(policy.readable);
+  const fields: ApplicantContinuation["fields"] = {};
+  for (const key of policy.readable) {
+    const f = fieldMap.get(key);
+    fields[key] = {
+      value: f?.value ?? deserializeFieldValue(key, null),
+      updatedAtVersion: f?.updatedAtVersion ?? 0,
+    };
+  }
+
+  const open = app.corrections[0];
+  await writeAudit(prisma, {
+    applicationId: id,
+    actorRole: "applicant",
+    action: "continuation.read",
+    decision: "ALLOW",
+    state,
+    atVersion: app.version,
+    allowedFields: [...readable],
+    deniedFields: [],
+    reasonCode: null,
+    note: `step=${resolvedStep}`,
+  });
+
+  return {
+    id: app.id,
+    state,
+    version: app.version,
+    step: resolvedStep,
+    fields,
+    writable: policy.writable,
+    openCorrection: open
+      ? { fields: safeParseStringArray(open.fields), reasonCode: open.reasonCode, note: open.note }
+      : null,
+  };
 }
 
 export interface StaffListItem {

@@ -43,10 +43,18 @@ export interface FieldMergeSummary {
   conflictReason: "STALE_EDIT" | "PROTECTED_ACCOMMODATION" | null;
 }
 
+export interface DeniedFieldSummary {
+  key: string;
+  reasonCode: string;
+}
+
 export interface DraftPatchResponse {
   application: ApplicationDTO;
   applied: FieldMergeSummary[];
   conflicts: FieldMergeSummary[];
+  // Fields the server refused to write (unknown / over-privileged / not
+  // writable in the current state or step). Each carries an auditable reason.
+  denied: DeniedFieldSummary[];
 }
 
 export interface SubmitResponse {

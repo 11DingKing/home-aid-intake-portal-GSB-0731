@@ -5,6 +5,7 @@ import type { ApplicationView } from "@/server/applicationService";
 import type {
   ApplicationDTO,
   ApiError,
+  DeniedFieldSummary,
   DraftPatchResponse,
   FieldMergeSummary,
   SubmitResponse,
@@ -133,6 +134,9 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
   const [step, setStep] = useState(0);
   const [errors, setErrors] = useState<FieldError[]>([]);
   const [conflicts, setConflicts] = useState<FieldMergeSummary[]>([]);
+  // Fields the server refused to write (unknown / over-privileged / not in the
+  // current step's whitelist). Surfaced with the server's auditable reason code.
+  const [denied, setDenied] = useState<DeniedFieldSummary[]>([]);
   const [announce, setAnnounce] = useState("");
   const [saving, setSaving] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -274,6 +278,7 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
     }
     setSaving(true);
     setConflicts([]);
+    setDenied([]);
     try {
       const edits = Array.from(dirty).map((key) => ({
         key,
@@ -285,7 +290,9 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
       const res = await fetch(`/api/applications/${id}/draft`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ baseVersion: serverVersion, edits }),
+        // Send the current step so the server recomputes the writable whitelist
+        // for (state, step) and rejects anything outside it with an audited reason.
+        body: JSON.stringify({ baseVersion: serverVersion, step: STEPS[step]!.id, edits }),
       });
       if (!res.ok) {
         const body = (await res.json()) as ApiError;
@@ -304,7 +311,7 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
       setSaving(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dirty, values, fieldBase, fieldBaseValue, serverVersion, id]);
+  }, [dirty, values, fieldBase, fieldBaseValue, serverVersion, id, step]);
 
   const reconcile = useCallback(
     (data: DraftPatchResponse) => {
@@ -351,21 +358,27 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
         return nd;
       });
       setConflicts(data.conflicts);
+      setDenied(data.denied ?? []);
       clearDraft(id);
       setRestored(false);
 
+      const deniedCount = data.denied?.length ?? 0;
+      const deniedSuffix =
+        deniedCount > 0
+          ? ` ${deniedCount} field(s) were rejected as not editable on this step; the reason was recorded in the audit trail.`
+          : "";
       if (data.conflicts.length > 0) {
         const protectedCount = data.conflicts.filter(
           (c) => c.conflictReason === "PROTECTED_ACCOMMODATION",
         ).length;
         const base = `Saved ${data.applied.length} change(s). ${data.conflicts.length} field(s) had conflicting edits and now show the server's value.`;
         setAnnounce(
-          protectedCount > 0
+          (protectedCount > 0
             ? `${base} An accommodation request was protected from being cleared by an older draft.`
-            : base,
+            : base) + deniedSuffix,
         );
       } else {
-        setAnnounce(`Saved ${data.applied.length} change(s). Everything is up to date.`);
+        setAnnounce(`Saved ${data.applied.length} change(s). Everything is up to date.${deniedSuffix}`);
       }
     },
     [id],
@@ -568,6 +581,10 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
 
       {conflicts.length > 0 ? (
         <ConflictList conflicts={conflicts} onGo={goToField} onDismiss={() => setConflicts([])} />
+      ) : null}
+
+      {denied.length > 0 ? (
+        <DeniedList denied={denied} onDismiss={() => setDenied([])} />
       ) : null}
 
       <Stepper current={step} values={values} />
@@ -953,6 +970,53 @@ function ConflictList({
           </li>
         ))}
       </ul>
+      <button type="button" className="secondary" onClick={onDismiss}>
+        Dismiss
+      </button>
+    </div>
+  );
+}
+
+function DENIED_REASON_LABEL(code: string): string {
+  switch (code) {
+    case "UNKNOWN_FIELD":
+      return "not a recognized field";
+    case "NOT_IN_STEP_WHITELIST":
+      return "not editable on this step";
+    case "NOT_WRITABLE_IN_STATE":
+      return "not editable in the current status";
+    case "ROLE_NOT_PERMITTED":
+      return "not permitted for your role";
+    default:
+      return "rejected";
+  }
+}
+
+function DeniedList({
+  denied,
+  onDismiss,
+}: {
+  denied: DeniedFieldSummary[];
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="banner" data-tone="warn" role="alert" data-testid="denied-summary">
+      <span className="banner-title">
+        {denied.length} field edit(s) were rejected by the server and not saved.
+      </span>
+      <ul>
+        {denied.map((d) => (
+          <li key={`${d.key}-${d.reasonCode}`} data-testid={`denied-${d.key}`}>
+            <strong>{d.key}</strong>: {DENIED_REASON_LABEL(d.reasonCode)}{" "}
+            <span className="sr-only">reason code</span>
+            <code>{d.reasonCode}</code>
+          </li>
+        ))}
+      </ul>
+      <p className="hint">
+        These changes were not applied. The rejection and its reason are recorded
+        in the application&apos;s audit trail.
+      </p>
       <button type="button" className="secondary" onClick={onDismiss}>
         Dismiss
       </button>

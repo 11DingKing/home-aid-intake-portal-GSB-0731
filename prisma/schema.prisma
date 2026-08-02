@@ -32,6 +32,7 @@ model Application {
   corrections Correction[]
   events      ApplicationEvent[]
   idempotency IdempotencyKey[]
+  auditLogs   AuditLog[]
 
   @@index([state])
 }
@@ -118,4 +119,37 @@ model IdempotencyKey {
   application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
 
   @@index([applicationId])
+}
+
+model AuditLog {
+  // Auditable trail of every field-level access decision (read projection and
+  // write attempts). Denials record WHICH fields were refused and WHY so an
+  // over-privileged read or a maliciously crafted hidden-field submit is always
+  // explainable after the fact.
+  id            String   @id @default(cuid())
+  applicationId String
+  // "applicant" | "staff" | "system"
+  actorRole     String
+  // e.g. "continuation.read" | "draft.write" | "materials.write"
+  action        String
+  // "ALLOW" | "DENY" | "PARTIAL"
+  decision      String
+  // Application state at the moment the decision was computed.
+  state         String
+  // Application version the decision was computed against.
+  atVersion     Int
+  // JSON-encoded list of field keys that were allowed.
+  allowedFields String
+  // JSON-encoded list of field keys that were denied (empty when none).
+  deniedFields  String
+  // Machine-readable reason for a denial, e.g. "NOT_IN_STEP_WHITELIST".
+  reasonCode    String?
+  // Human-readable detail for auditors.
+  note          String?
+  createdAt     DateTime @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+  @@index([decision])
 }

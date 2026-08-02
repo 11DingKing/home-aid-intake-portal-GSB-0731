@@ -30,10 +30,10 @@ npm run dev                # http://localhost:3000
 Native verification (all three pass):
 
 ```bash
-npm test                   # Vitest: 62 domain + integration tests
+npm test                   # Vitest: 97 domain + integration tests
 npm run build              # prisma generate + next build (TS strict, no errors ignored)
 npm run dev                # dev server
-npm run test:e2e           # Playwright: 26 accessibility, convergence + resilience tests
+npm run test:e2e           # Playwright: 31 accessibility, convergence, resilience + access-boundary tests
 ```
 
 `npm run test:e2e` is hermetic: it resets and seeds a separate `prisma/e2e.db`,
@@ -65,9 +65,10 @@ src/
     validation.ts      Zod field schemas + whole-application submission checks
     merge.ts           field-level three-way conflict resolution
     disclosure.ts      least-privilege projection for staff views
+    accessPolicy.ts    server-authoritative field read/write whitelist by (role,state,step)
   server/        Persistence + orchestration (integration-tested against SQLite)
     db.ts              PrismaClient singleton
-    applicationService.ts  transactional create/patch/submit/staff actions
+    applicationService.ts  transactional create/patch/submit/staff actions + audit
     fieldSerialization.ts  scalar/array (de)serialization for TEXT columns
     ids.ts, errors.ts, http.ts
   app/
@@ -205,7 +206,40 @@ reasonable-accommodation need survives a document swap. Editable only in
 
 ---
 
-## Field-level disclosure (staff least privilege)
+## Field-level access policy (server-authoritative, recomputed every request)
+
+[`src/domain/accessPolicy.ts`](src/domain/accessPolicy.ts) is the single source of
+truth for **which fields an actor may READ or WRITE given the current
+`(role, state, step)`**. It is recomputed **server-side on every load and every
+submit** — the client cache is never trusted. Both the applicant continuation
+surface and the staff continuation surface funnel through it.
+
+- **Least privilege per step.** The applicant wizard only requests the minimal
+  fields the current step needs; the server independently recomputes that same
+  whitelist. A field the step does not own is **excluded from the projection and
+  rejected on write** — not merely hidden in the UI.
+- **Staff never receive applicant PII.** `fullName`, `contactPhone`,
+  `contactEmail` are excluded from every staff read in every state/step, with a
+  defensive second strip in the service layer.
+- **Accommodations are read-only for staff.** Staff can *see* a reasonable
+  accommodation to honor it, but the staff paths never write applicant field
+  values, so a caseworker action can never overwrite the accommodation need.
+- **Write classification with auditable reasons.** `evaluateWrites` classifies
+  every requested key into `allowed` vs `denied` with a specific
+  `DenyReasonCode`:
+
+  | Reason code | Meaning |
+  | --- | --- |
+  | `UNKNOWN_FIELD` | A crafted/hidden key that is not a real applicant field |
+  | `NOT_IN_STEP_WHITELIST` | A known field, but not writable on the current step |
+  | `NOT_WRITABLE_IN_STATE` | The state (e.g. `SUBMITTED`) forbids field edits |
+  | `ROLE_NOT_PERMITTED` | A staff actor attempting an applicant-field write |
+
+  Denied keys are dropped **before** the merge, so a maliciously constructed
+  hidden field can never reach persistence. `PATCH /draft` returns the `denied[]`
+  list and the wizard surfaces it in an accessible notice.
+
+### Staff disclosure views (least privilege)
 
 Staff views come from `application-cases.json` and are enforced in
 [`src/domain/disclosure.ts`](src/domain/disclosure.ts). The projection copies
@@ -217,11 +251,38 @@ payload, not merely hidden in the UI.
 | `INTAKE_REVIEW` | `id`, `state`, `exemptionReason`, `materialMetadata`, `accommodations` |
 | `CORRECTION_REVIEW` | `id`, `state`, `correctionFields`, `submittedFieldMetadata` |
 
-Applicant PII (`fullName`, `contactPhone`, `contactEmail`) is **never** included
-in either staff view or the staff queue list. `materialMetadata` is metadata only
-(kind, filename, mime, size, uploadedAt) — never file bytes. The staff detail
-page picks `CORRECTION_REVIEW` for `NEEDS_CORRECTION`/`RESUBMITTED` and
-`INTAKE_REVIEW` otherwise; a switcher lets staff move between views explicitly.
+The disclosure view is **recomputed from the current state**, never taken from
+the `?view=` query param: `NEEDS_CORRECTION`/`RESUBMITTED` map to
+`CORRECTION_REVIEW`, everything else to `INTAKE_REVIEW`.
+
+- **Stale-link downgrade.** A staff member who opens an old link at the
+  `NEEDS_CORRECTION ↔ RESUBMITTED` boundary (or after the app is accepted) may
+  request a broader view than the current state permits. The server **downgrades**
+  to the state-appropriate view: the broader view's extra keys never appear in the
+  rendered HTML *or* the API body. The response carries `X-Enforced-View`,
+  `X-View-Downgraded`, and `X-Application-State` headers, and the staff page shows
+  a `stale-view-notice` banner. The refusal is audited with the reason code
+  `STALE_VIEW_DOWNGRADED` and the list of fields that were withheld.
+
+`materialMetadata` is metadata only (kind, filename, mime, size, uploadedAt) —
+never file bytes.
+
+## Audit trail
+
+Every field-level access decision — reads **and** write attempts — is recorded in
+the `AuditLog` table (`getAuditTrail`, exposed at `GET
+/api/applications/:id/audit`). Each entry captures `actorRole`, `action`
+(`continuation.read` / `draft.write`), `decision` (`ALLOW`/`DENY`/`PARTIAL`),
+`state`, `atVersion`, the `allowedFields[]` and `deniedFields[]`, a `reasonCode`,
+and a human note. This makes an over-privileged read or a crafted hidden-field
+submit always explainable after the fact:
+
+- A partial write that drops a crafted `isAdmin` key → `PARTIAL` /
+  `deniedFields:["isAdmin"]` / `UNKNOWN_FIELD`.
+- A write against a locked state → `DENY` / `NOT_WRITABLE_IN_STATE` (written on
+  its own connection so the record survives the rejected transaction's rollback).
+- A stale broader staff link → `PARTIAL` / `STALE_VIEW_DOWNGRADED` with the
+  withheld fields.
 
 ---
 
@@ -258,16 +319,18 @@ All errors use the envelope `{ "error": { "code", "message", "details" } }`.
 | --- | --- | --- | --- |
 | `POST` | `/api/applications` | — | Creates a `DRAFT`; returns the application view (201). |
 | `GET` | `/api/applications/:id` | — | Full applicant-facing view. |
-| `PATCH` | `/api/applications/:id/draft` | `{ baseVersion, edits:[{key,value,baseVersion,baseValue?}] }` | Field-level three-way merge (`baseValue` = common ancestor; omit for version fallback). Returns `{ application, applied[], conflicts[] }`; each item carries `basis` and `conflictReason`. `NOT_EDITABLE` if state disallows edits. |
+| `GET` | `/api/applications/:id/continuation?step=contact\|eligibility\|materials\|accommodations\|review` | — | Step-scoped continuation: only the fields the step may **read** (recomputed server-side) plus the `writable[]` list. Fields outside the step are absent from the payload, not hidden. Every read is audited. |
+| `PATCH` | `/api/applications/:id/draft` | `{ baseVersion, step?, edits:[{key,value,baseVersion,baseValue?}] }` | Field-level three-way merge (`baseValue` = common ancestor; omit for version fallback). The server recomputes the writable whitelist from `(state, step)` and drops out-of-step / unknown / over-privileged keys before the merge. Returns `{ application, applied[], conflicts[], denied[] }`; `denied[]` carries each rejected key with its `reasonCode`. `NOT_EDITABLE` if state disallows edits. |
 | `POST` | `/api/applications/:id/submit` | `{ baseVersion }` + `Idempotency-Key` header | Submit or resubmit. `VALIDATION_FAILED` (422), `VERSION_CONFLICT` (409), or `{ application, replayed }`. Same key replays. |
 | `POST` | `/api/applications/:id/materials` | `{ fieldKey, kind, filename, mimeType, sizeBytes, checksum?, materialId? }` | Replace attachment **metadata** (never bytes). Returns `{ application, material, replacedMaterialId }` (201). Preserves accommodations. `NOT_EDITABLE` outside `DRAFT`/`NEEDS_CORRECTION`. |
+| `GET` | `/api/applications/:id/audit` | — | The auditable field-level access decision trail: `{ entries:[{ actorRole, action, decision, state, atVersion, allowedFields[], deniedFields[], reasonCode, note, createdAt }] }`. |
 
 ### Staff
 
 | Method | Path | Body | Notes |
 | --- | --- | --- | --- |
 | `GET` | `/api/staff/applications` | — | Queue: `id`, `state`, `accommodations`, `updatedAt` (no PII). |
-| `GET` | `/api/staff/applications/:id?view=INTAKE_REVIEW\|CORRECTION_REVIEW` | — | Disclosure-limited projection (whitelisted keys only). |
+| `GET` | `/api/staff/applications/:id?view=INTAKE_REVIEW\|CORRECTION_REVIEW` | — | Disclosure-limited projection (whitelisted keys only). The view is **recomputed from the current state**; a stale/broader `?view=` is downgraded (never widens disclosure) and audited. Response headers: `X-Enforced-View`, `X-View-Downgraded`, `X-Application-State`. |
 | `POST` | `/api/staff/applications/:id/request-correction` | `{ fields[], reasonCode, note?, baseVersion? }` | From `SUBMITTED`/`RESUBMITTED` → `NEEDS_CORRECTION`; from `NEEDS_CORRECTION` amends in place (self-loop, unions fields). Returns `{ application, concurrentFields, amended }` — `concurrentFields` are applicant edits after `baseVersion`. Illegal from terminal → `INVALID_TRANSITION` (409). |
 | `POST` | `/api/staff/applications/:id/decision` | `{ action: "accept"\|"decline", note? }` | Terminal transition. Illegal from terminal → `INVALID_TRANSITION` (409). |
 
@@ -332,17 +395,26 @@ convergence evidence.
 
 - **Unit** (`tests/unit`): state machine (incl. `amendCorrection` self-loop and
   illegal backward transitions), material rules, validation, field-level
-  two-way + three-way merge, `fieldsChangedSince`, disclosure projection — pure
-  functions, no DB.
+  two-way + three-way merge, `fieldsChangedSince`, disclosure projection, and the
+  field-level **access policy** (per-step read/write whitelists, staff PII
+  exclusion, write classification with reason codes) — pure functions, no DB.
 - **Integration** (`tests/integration`): the application service against a real
   SQLite `test.db` (created fresh per run) — full lifecycle, idempotency, version
   conflicts, protected accommodations, staff disclosure, concurrent staff
-  correction + applicant supplement, and attachment metadata replacement.
+  correction + applicant supplement, attachment metadata replacement, and
+  **access-policy enforcement + audit** (out-of-step/crafted writes dropped and
+  audited, stale-link staff view recomputation, step-scoped applicant
+  continuation).
 - **E2E** (`tests/e2e`): Chromium against a production build — accessibility
   (names, associated errors, keyboard, focus, non-color status, live regions),
   offline recovery, two-session convergence, duplicate submit, correction
-  round-trip, concurrent staff amend, staff least-privilege, and resilience
+  round-trip, concurrent staff amend, staff least-privilege, resilience
   (submit-success-then-timeout retry, illegal backward transitions, attachment
-  metadata replacement).
+  metadata replacement), and **access-boundary** adversarial scenarios: a stale
+  link at the `NEEDS_CORRECTION ↔ RESUBMITTED` boundary is downgraded (over-
+  privileged fields absent from HTML *and* API), a crafted hidden-field submit is
+  rejected while the accommodation is preserved and the refusal audited, the
+  wizard surfaces the denied-field reason, and two browser contexts recover focus
+  without losing the accommodation.
 
 Docker is not required.

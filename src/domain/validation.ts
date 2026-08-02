@@ -80,7 +80,12 @@ export function isApplicantFieldKey(key: string): key is ApplicantFieldKey {
 // it started editing from (enables true three-way field merge).
 const editValue = z.union([z.string(), z.array(z.string()), z.null()]);
 export const draftFieldEditSchema = z.object({
-  key: z.string().refine(isApplicantFieldKey, "Unknown field."),
+  // Accept ANY string key at the transport layer: unknown / over-privileged keys
+  // (e.g. a maliciously crafted hidden field) are not rejected with a blunt 400 —
+  // they are carried through so the server-side access policy can classify and
+  // AUDIT each one with a specific reason. `isApplicantFieldKey` still gates
+  // what may actually be written.
+  key: z.string().min(1).max(120),
   value: editValue,
   baseVersion: z.number().int().nonnegative(),
   // Present => three-way merge; absent => version-based fallback.
@@ -88,9 +93,16 @@ export const draftFieldEditSchema = z.object({
 });
 export type DraftFieldEdit = z.infer<typeof draftFieldEditSchema>;
 
+// Applicant continuation step (scopes the writable whitelist). Optional; the
+// server defaults to the broadest applicant self-view ("review").
+const stepSchema = z
+  .enum(["contact", "eligibility", "materials", "accommodations", "review"])
+  .optional();
+
 export const draftPatchSchema = z.object({
   // The application version the client believes it is editing from.
   baseVersion: z.number().int().nonnegative(),
+  step: stepSchema,
   edits: z.array(draftFieldEditSchema).min(1, "Provide at least one field edit."),
 });
 export type DraftPatchInput = z.infer<typeof draftPatchSchema>;
