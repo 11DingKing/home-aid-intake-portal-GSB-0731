@@ -31,6 +31,30 @@ describe("state machine", () => {
     expect(canTransition("SUBMITTED", "submit")).toBe(false);
   });
 
+  it("supports amendCorrection as a NEEDS_CORRECTION self-loop only", () => {
+    // Staff may refine a correction while the applicant is still editing.
+    expect(nextState("NEEDS_CORRECTION", "amendCorrection")).toBe("NEEDS_CORRECTION");
+    // But amend is not legal from other states.
+    expect(nextState("SUBMITTED", "amendCorrection")).toBeNull();
+    expect(nextState("RESUBMITTED", "amendCorrection")).toBeNull();
+    expect(nextState("ACCEPTED", "amendCorrection")).toBeNull();
+  });
+
+  it("rejects illegal backward transitions (no un-accepting / un-declining / un-submitting)", () => {
+    // Terminal states cannot move backward.
+    expect(nextState("ACCEPTED", "requestCorrection")).toBeNull();
+    expect(nextState("ACCEPTED", "resubmit")).toBeNull();
+    expect(nextState("DECLINED", "requestCorrection")).toBeNull();
+    // A submitted application cannot be pushed back to draft via any action.
+    for (const action of ["submit", "resubmit", "amendCorrection"] as const) {
+      expect(nextState("SUBMITTED", action)).not.toBe("DRAFT");
+    }
+    // NEEDS_CORRECTION only advances (resubmit) or self-loops (amend); it never
+    // regresses to SUBMITTED or DRAFT.
+    expect(nextState("NEEDS_CORRECTION", "submit")).toBeNull();
+    expect(canTransition("NEEDS_CORRECTION", "accept")).toBe(false);
+  });
+
   it("assertTransition throws a typed error on illegal transitions", () => {
     expect(() => assertTransition("ACCEPTED", "submit")).toThrow(StateTransitionError);
     try {

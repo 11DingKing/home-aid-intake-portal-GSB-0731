@@ -17,6 +17,7 @@ import type { ApplicationState } from "./constants";
 export type ApplicationAction =
   | "submit"
   | "requestCorrection"
+  | "amendCorrection"
   | "resubmit"
   | "accept"
   | "decline";
@@ -25,6 +26,7 @@ export const ACTOR_BY_ACTION: Record<ApplicationAction, "applicant" | "staff"> =
   submit: "applicant",
   resubmit: "applicant",
   requestCorrection: "staff",
+  amendCorrection: "staff",
   accept: "staff",
   decline: "staff",
 };
@@ -36,7 +38,9 @@ const TRANSITIONS: Record<ApplicationState, Partial<Record<ApplicationAction, Ap
     accept: "ACCEPTED",
     decline: "DECLINED",
   },
-  NEEDS_CORRECTION: { resubmit: "RESUBMITTED" },
+  // amendCorrection is a self-loop: staff can add/refine a correction reason code
+  // while the applicant is concurrently supplementing materials in this state.
+  NEEDS_CORRECTION: { resubmit: "RESUBMITTED", amendCorrection: "NEEDS_CORRECTION" },
   RESUBMITTED: {
     requestCorrection: "NEEDS_CORRECTION",
     accept: "ACCEPTED",

@@ -30,10 +30,10 @@ npm run dev                # http://localhost:3000
 Native verification (all three pass):
 
 ```bash
-npm test                   # Vitest: 45 domain + integration tests
+npm test                   # Vitest: 62 domain + integration tests
 npm run build              # prisma generate + next build (TS strict, no errors ignored)
 npm run dev                # dev server
-npm run test:e2e           # Playwright: 19 accessibility + convergence tests
+npm run test:e2e           # Playwright: 26 accessibility, convergence + resilience tests
 ```
 
 `npm run test:e2e` is hermetic: it resets and seeds a separate `prisma/e2e.db`,
@@ -63,7 +63,7 @@ src/
     stateMachine.ts    transitions, terminal states, editability
     materialRules.ts   required-material rules incl. NO_FIXED_INCOME waiver
     validation.ts      Zod field schemas + whole-application submission checks
-    merge.ts           field-level offline conflict resolution
+    merge.ts           field-level three-way conflict resolution
     disclosure.ts      least-privilege projection for staff views
   server/        Persistence + orchestration (integration-tested against SQLite)
     db.ts              PrismaClient singleton
@@ -101,13 +101,23 @@ NEEDS_CORRECTION ──resubmit────▶ RESUBMITTED
 RESUBMITTED ──accept────▶ ACCEPTED        (terminal)
 RESUBMITTED ──decline───▶ DECLINED        (terminal)
 RESUBMITTED ──requestCorrection──▶ NEEDS_CORRECTION
+NEEDS_CORRECTION ──amendCorrection──▶ NEEDS_CORRECTION   (self-loop)
 ```
 
 - **Editable states:** `DRAFT` and `NEEDS_CORRECTION` — only here can applicant
-  fields be patched. Any other state rejects patches with `NOT_EDITABLE`.
+  fields be patched (or materials replaced). Any other state rejects with
+  `NOT_EDITABLE`.
 - **Actors:** `submit`/`resubmit` are applicant actions; `requestCorrection`,
-  `accept`, `decline` are staff actions. Illegal transitions throw
-  `INVALID_TRANSITION` (`src/domain/stateMachine.ts`).
+  `amendCorrection`, `accept`, `decline` are staff actions. Illegal transitions
+  throw `INVALID_TRANSITION` — the route layer maps this to **HTTP 409** (a
+  client conflict, not a 500). Backward moves are structurally impossible: you
+  cannot un-accept, un-decline, or push a `SUBMITTED`/`NEEDS_CORRECTION`
+  application back to `DRAFT`.
+- **`amendCorrection`** is a `NEEDS_CORRECTION` self-loop so a staff member can
+  refine/append a correction reason code *while the applicant is concurrently
+  supplementing materials in the same state* — without an illegal backward
+  transition and without stacking duplicate corrections (flagged fields are
+  unioned).
 - Every transition is recorded in `ApplicationEvent` (from → to, actor, note).
 - The single `/submit` endpoint chooses `submit` vs `resubmit` from the current
   state, so first submission and post-correction resubmission share one path.
@@ -132,36 +142,66 @@ not blocked on it. All other required materials (identity) still apply.
 
 ---
 
-## Draft conflict resolution (offline → server convergence)
+## Draft conflict resolution (three-way merge → convergence)
 
 Each editable field row carries `updatedAtVersion` — the application version at
-which it last changed. The client caches pending edits per field with the
-`baseVersion` it started from (`src/lib/draftStore.ts`). On save, the server
-merges field-by-field (`src/domain/merge.ts`):
+which it last changed. The client caches, per field, the value **plus** the
+`baseVersion` **and `baseValue`** (the common ancestor) it started editing from
+(`src/lib/draftStore.ts`). On save, the server merges field-by-field with a true
+**three-way merge** (`src/domain/merge.ts`), falling back to version-based
+two-way resolution when no `baseValue` is supplied:
 
-1. **Server field not moved since your baseVersion** → the edit **applies**.
-2. **Server moved but the value is identical** → **no-op** (already converged).
-3. **Server moved and the value differs** → **conflict**: the field keeps the
-   **server** value, and the client is shown both so it can re-edit. Other,
-   non-conflicting fields in the same patch still apply.
-4. **Protected accommodations:** a stale draft can never *clear* a reasonable
-   accommodation the server currently holds. Such an edit is rejected as a
-   `PROTECTED_ACCOMMODATION` conflict instead of silently wiping the need.
+| base vs server vs client | result |
+| --- | --- |
+| client == server | **no-op** (already converged) |
+| client == base (client didn't really change it) | **no-op**, keep server value |
+| server == base (server untouched since base) | **applied**, take client value |
+| both changed the same field differently | **conflict** → keep **server** value, return client value for re-edit |
 
-The three offline-conflict examples from `application-cases.json` map to:
+Empty values are coalesced: `null`, `[]`, and a blank string all mean "unset",
+so an unsaved offline field never reads as a spurious change.
+
+- **Protected accommodations:** a merge can *never clear* a reasonable
+  accommodation the server currently holds — any edit that would empty a
+  non-empty accommodation field is returned as a `PROTECTED_ACCOMMODATION`
+  conflict. This holds across correction, offline recovery, duplicate submit,
+  and attachment replacement.
+- **Concurrent applicant + staff on the same old draft:** while an application is
+  in `NEEDS_CORRECTION`, the applicant can supplement materials (a field patch)
+  at the same time a staff member writes a correction reason code. The correction
+  path **never writes field values**, so the applicant's supplement (and the
+  accommodation need) is preserved; and because the staff request carries its own
+  `baseVersion`, the server returns `concurrentFields` — the applicant fields
+  changed meanwhile — to the **staff** session so it reconciles its view rather
+  than silently overwriting its mental model. Each session sees the conflict that
+  is relevant to it.
+
+The offline-conflict examples from `application-cases.json` map to:
 
 | Example | Handling |
 | --- | --- |
 | *same base version with different field edits* | both apply — no conflict (fields are independent) |
-| *server accepted while client remains draft* | client save merges; unchanged fields no-op, diverged fields conflict to server value |
+| *server accepted while client remains draft* | three-way merge; unchanged fields no-op, co-edited fields conflict to server value |
 | *duplicate submit with same idempotency key* | replayed, not re-transitioned (see below) |
 
 **Optimistic concurrency & idempotency.** Final submission requires the client's
 `baseVersion` to equal the server version, else `VERSION_CONFLICT` (409). Submits
 carry an `Idempotency-Key`; a repeat of the same key **replays** the original
-outcome (`replayed: true`) instead of performing a second transition. Everything
-is keyed on the server-issued application id and the monotonic `version`, so a
-client cache and the server always reconverge on the same `(id, version, state)`.
+outcome (`replayed: true`) instead of performing a second transition — even if
+the retry arrives at a stale version after a browser timeout, and it never
+disturbs accommodations. Everything is keyed on the server-issued application id
+and the monotonic `version`, so client cache and server reconverge on the same
+`(id, version, state)`.
+
+### Attachment metadata replacement
+
+`POST /api/applications/:id/materials` replaces the metadata bound to a material
+field (`identityProof` / `economicProof`). It writes **metadata only, never
+bytes**: it creates a new `MaterialMetadata` row, repoints the field (bumping the
+field version so a concurrent stale edit three-way-conflicts), and detaches the
+previously referenced metadata. It never touches accommodation fields, so a
+reasonable-accommodation need survives a document swap. Editable only in
+`DRAFT` / `NEEDS_CORRECTION`.
 
 ---
 
@@ -218,8 +258,9 @@ All errors use the envelope `{ "error": { "code", "message", "details" } }`.
 | --- | --- | --- | --- |
 | `POST` | `/api/applications` | — | Creates a `DRAFT`; returns the application view (201). |
 | `GET` | `/api/applications/:id` | — | Full applicant-facing view. |
-| `PATCH` | `/api/applications/:id/draft` | `{ baseVersion, edits:[{key,value,baseVersion}] }` | Field-level merge. Returns `{ application, applied[], conflicts[] }`. `NOT_EDITABLE` if state disallows edits. |
-| `POST` | `/api/applications/:id/submit` | `{ baseVersion }` + `Idempotency-Key` header | Submit or resubmit. `VALIDATION_FAILED` (422), `VERSION_CONFLICT` (409), or `{ application, replayed }`. |
+| `PATCH` | `/api/applications/:id/draft` | `{ baseVersion, edits:[{key,value,baseVersion,baseValue?}] }` | Field-level three-way merge (`baseValue` = common ancestor; omit for version fallback). Returns `{ application, applied[], conflicts[] }`; each item carries `basis` and `conflictReason`. `NOT_EDITABLE` if state disallows edits. |
+| `POST` | `/api/applications/:id/submit` | `{ baseVersion }` + `Idempotency-Key` header | Submit or resubmit. `VALIDATION_FAILED` (422), `VERSION_CONFLICT` (409), or `{ application, replayed }`. Same key replays. |
+| `POST` | `/api/applications/:id/materials` | `{ fieldKey, kind, filename, mimeType, sizeBytes, checksum?, materialId? }` | Replace attachment **metadata** (never bytes). Returns `{ application, material, replacedMaterialId }` (201). Preserves accommodations. `NOT_EDITABLE` outside `DRAFT`/`NEEDS_CORRECTION`. |
 
 ### Staff
 
@@ -227,8 +268,8 @@ All errors use the envelope `{ "error": { "code", "message", "details" } }`.
 | --- | --- | --- | --- |
 | `GET` | `/api/staff/applications` | — | Queue: `id`, `state`, `accommodations`, `updatedAt` (no PII). |
 | `GET` | `/api/staff/applications/:id?view=INTAKE_REVIEW\|CORRECTION_REVIEW` | — | Disclosure-limited projection (whitelisted keys only). |
-| `POST` | `/api/staff/applications/:id/request-correction` | `{ fields[], reasonCode, note? }` | `SUBMITTED`/`RESUBMITTED` → `NEEDS_CORRECTION`; opens a correction. |
-| `POST` | `/api/staff/applications/:id/decision` | `{ action: "accept"\|"decline", note? }` | Terminal transition. |
+| `POST` | `/api/staff/applications/:id/request-correction` | `{ fields[], reasonCode, note?, baseVersion? }` | From `SUBMITTED`/`RESUBMITTED` → `NEEDS_CORRECTION`; from `NEEDS_CORRECTION` amends in place (self-loop, unions fields). Returns `{ application, concurrentFields, amended }` — `concurrentFields` are applicant edits after `baseVersion`. Illegal from terminal → `INVALID_TRANSITION` (409). |
+| `POST` | `/api/staff/applications/:id/decision` | `{ action: "accept"\|"decline", note? }` | Terminal transition. Illegal from terminal → `INVALID_TRANSITION` (409). |
 
 ---
 
@@ -289,14 +330,19 @@ convergence evidence.
 
 ## Testing
 
-- **Unit** (`tests/unit`): state machine, material rules, validation, field-level
-  merge, disclosure projection — pure functions, no DB.
+- **Unit** (`tests/unit`): state machine (incl. `amendCorrection` self-loop and
+  illegal backward transitions), material rules, validation, field-level
+  two-way + three-way merge, `fieldsChangedSince`, disclosure projection — pure
+  functions, no DB.
 - **Integration** (`tests/integration`): the application service against a real
   SQLite `test.db` (created fresh per run) — full lifecycle, idempotency, version
-  conflicts, protected accommodations, staff disclosure.
+  conflicts, protected accommodations, staff disclosure, concurrent staff
+  correction + applicant supplement, and attachment metadata replacement.
 - **E2E** (`tests/e2e`): Chromium against a production build — accessibility
   (names, associated errors, keyboard, focus, non-color status, live regions),
   offline recovery, two-session convergence, duplicate submit, correction
-  round-trip, staff least-privilege.
+  round-trip, concurrent staff amend, staff least-privilege, and resilience
+  (submit-success-then-timeout retry, illegal backward transitions, attachment
+  metadata replacement).
 
 Docker is not required.

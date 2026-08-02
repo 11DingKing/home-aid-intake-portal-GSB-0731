@@ -118,6 +118,16 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
     }
     return base;
   });
+  // Per-field base VALUE = the common ancestor the user started editing from.
+  // Sent to the server for three-way merge so a stale edit only conflicts when
+  // BOTH the applicant and the server actually changed the same field.
+  const [fieldBaseValue, setFieldBaseValue] = useState<Record<string, StoredValue>>(() => {
+    const bv: Record<string, StoredValue> = {};
+    for (const key of Object.keys(initial.fields) as ApplicantFieldKey[]) {
+      bv[key] = initial.fields[key].value;
+    }
+    return bv;
+  });
   // Which fields have local unsaved edits.
   const [dirty, setDirty] = useState<Set<ApplicantFieldKey>>(new Set());
   const [step, setStep] = useState(0);
@@ -147,15 +157,18 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
     setValues((prev) => {
       const next = { ...prev };
       const newBase = { ...fieldBase };
+      const newBaseValue = { ...fieldBaseValue };
       const newDirty = new Set<ApplicantFieldKey>();
       for (const [k, cachedField] of Object.entries(cached.fields)) {
         if (!cachedField) continue;
         const key = k as ApplicantFieldKey;
         applyStoredValue(next, key, cachedField.value);
         newBase[key] = cachedField.baseVersion;
+        newBaseValue[key] = cachedField.baseValue;
         newDirty.add(key);
       }
       setFieldBase(newBase);
+      setFieldBaseValue(newBaseValue);
       setDirty(newDirty);
       return next;
     });
@@ -193,10 +206,20 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
 
   // ---- Persist to the offline cache on every edit -------------------------
   const persistCache = useCallback(
-    (nextValues: FormValues, nextBase: Record<ApplicantFieldKey, number>, dirtySet: Set<ApplicantFieldKey>, stepIdx: number) => {
+    (
+      nextValues: FormValues,
+      nextBase: Record<ApplicantFieldKey, number>,
+      nextBaseValue: Record<string, StoredValue>,
+      dirtySet: Set<ApplicantFieldKey>,
+      stepIdx: number,
+    ) => {
       const fields: CachedDraft["fields"] = {};
       for (const key of dirtySet) {
-        fields[key] = { value: fieldToStoredValue(key, nextValues), baseVersion: nextBase[key] ?? 0 };
+        fields[key] = {
+          value: fieldToStoredValue(key, nextValues),
+          baseVersion: nextBase[key] ?? 0,
+          baseValue: nextBaseValue[key] ?? null,
+        };
       }
       saveDraft({
         applicationId: id,
@@ -212,17 +235,25 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
   const setField = useCallback(
     <K extends ApplicantFieldKey>(key: K, value: FormValues[K] | StoredValue) => {
       setValues((prev) => {
+        // The value the field held before this edit is its common ancestor the
+        // first time it goes dirty (i.e., the last server-synced value).
+        const priorStored = fieldToStoredValue(key, prev);
         const next = { ...prev };
         applyStoredValue(next, key, value as StoredValue);
         setDirty((prevDirty) => {
           const nd = new Set(prevDirty);
           nd.add(key);
-          setFieldBase((prevBase) => {
-            // Only stamp the base version the first time this field goes dirty.
-            const base = { ...prevBase };
-            if (!prevDirty.has(key)) base[key] = base[key] ?? serverVersion;
-            persistCache(next, base, nd, step);
-            return base;
+          setFieldBaseValue((prevBV) => {
+            const bv = { ...prevBV };
+            // Only stamp the base value the first time this field goes dirty.
+            if (!prevDirty.has(key)) bv[key] = priorStored;
+            setFieldBase((prevBase) => {
+              const base = { ...prevBase };
+              if (!prevDirty.has(key)) base[key] = base[key] ?? serverVersion;
+              persistCache(next, base, bv, nd, step);
+              return base;
+            });
+            return bv;
           });
           return nd;
         });
@@ -248,6 +279,8 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
         key,
         value: fieldToStoredValue(key, values),
         baseVersion: fieldBase[key] ?? 0,
+        // Include the common-ancestor value for true three-way merge.
+        baseValue: fieldBaseValue[key] ?? null,
       }));
       const res = await fetch(`/api/applications/${id}/draft`, {
         method: "PATCH",
@@ -271,7 +304,7 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
       setSaving(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dirty, values, fieldBase, serverVersion, id]);
+  }, [dirty, values, fieldBase, fieldBaseValue, serverVersion, id]);
 
   const reconcile = useCallback(
     (data: DraftPatchResponse) => {
@@ -279,13 +312,21 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
       setServerVersion(app.version);
       setState(app.state);
       setOpenCorrection(app.openCorrection);
-      // Update base versions to the server's new per-field versions.
+      // Update base versions and base values to the server's per-field truth so
+      // the next edit is compared against the freshly-synced common ancestor.
       setFieldBase(() => {
         const base = {} as Record<ApplicantFieldKey, number>;
         for (const key of Object.keys(app.fields) as ApplicantFieldKey[]) {
           base[key] = app.fields[key].updatedAtVersion;
         }
         return base;
+      });
+      setFieldBaseValue(() => {
+        const bv: Record<string, StoredValue> = {};
+        for (const key of Object.keys(app.fields) as ApplicantFieldKey[]) {
+          bv[key] = app.fields[key].value;
+        }
+        return bv;
       });
 
       const conflictKeys = new Set(data.conflicts.map((c) => c.key));
@@ -428,6 +469,13 @@ export default function ApplyWizard({ initial }: { initial: ApplicationView }) {
         base[key] = app.fields[key].updatedAtVersion;
       }
       return base;
+    });
+    setFieldBaseValue(() => {
+      const bv: Record<string, StoredValue> = {};
+      for (const key of Object.keys(app.fields) as ApplicantFieldKey[]) {
+        bv[key] = app.fields[key].value;
+      }
+      return bv;
     });
     setDirty(new Set());
   }, [id]);

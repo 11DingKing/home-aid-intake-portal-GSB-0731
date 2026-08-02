@@ -76,11 +76,15 @@ export function isApplicantFieldKey(key: string): key is ApplicantFieldKey {
 }
 
 // A single draft field edit carried by the client, tagged with the base version
-// at which the applicant last observed the field (for field-level merge).
+// at which the applicant last observed the field, and optionally the base value
+// it started editing from (enables true three-way field merge).
+const editValue = z.union([z.string(), z.array(z.string()), z.null()]);
 export const draftFieldEditSchema = z.object({
   key: z.string().refine(isApplicantFieldKey, "Unknown field."),
-  value: z.union([z.string(), z.array(z.string()), z.null()]),
+  value: editValue,
   baseVersion: z.number().int().nonnegative(),
+  // Present => three-way merge; absent => version-based fallback.
+  baseValue: editValue.optional(),
 });
 export type DraftFieldEdit = z.infer<typeof draftFieldEditSchema>;
 

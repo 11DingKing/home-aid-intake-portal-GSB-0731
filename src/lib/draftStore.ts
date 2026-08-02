@@ -15,6 +15,9 @@ export interface CachedField {
   value: StoredValue;
   // The application version the user was editing from when they changed it.
   baseVersion: number;
+  // The common-ancestor value the field held when it first went dirty. Sent to
+  // the server to enable true three-way merge (base/server/client).
+  baseValue: StoredValue;
 }
 
 export interface CachedDraft {
@@ -78,11 +81,22 @@ export function pendingEdits(draft: CachedDraft): Array<{
   key: ApplicantFieldKey;
   value: StoredValue;
   baseVersion: number;
+  baseValue: StoredValue;
 }> {
-  const out: Array<{ key: ApplicantFieldKey; value: StoredValue; baseVersion: number }> = [];
+  const out: Array<{
+    key: ApplicantFieldKey;
+    value: StoredValue;
+    baseVersion: number;
+    baseValue: StoredValue;
+  }> = [];
   for (const [key, cached] of Object.entries(draft.fields)) {
     if (!cached) continue;
-    out.push({ key: key as ApplicantFieldKey, value: cached.value, baseVersion: cached.baseVersion });
+    out.push({
+      key: key as ApplicantFieldKey,
+      value: cached.value,
+      baseVersion: cached.baseVersion,
+      baseValue: cached.baseValue,
+    });
   }
   return out;
 }

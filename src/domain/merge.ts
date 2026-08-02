@@ -2,23 +2,30 @@ import { ACCOMMODATION_FIELD_KEYS, type ApplicantFieldKey } from "./constants";
 
 // Field-level draft merge / conflict resolution.
 //
+// This is a THREE-WAY merge (base / server / client) when the client supplies
+// the common-ancestor value it started editing from (`baseValue`), and falls
+// back to a version-based two-way merge when it does not.
+//
 // Each stored field carries `updatedAtVersion` — the application version at
-// which it last changed. A client edit carries `baseVersion` — the version the
-// client last observed for that field. The merge rule:
+// which it last changed. A client edit carries `baseVersion` (the version it
+// last observed) and, ideally, `baseValue` (the value it started from).
 //
-//   * If the server's field has NOT changed since the client's baseVersion
-//     (server.updatedAtVersion <= edit.baseVersion), accept the edit.
-//   * If the server's field HAS changed and the incoming value is identical,
-//     it is a no-op (converged) — accept silently.
-//   * If the server's field HAS changed and the value differs, it is a
-//     CONFLICT — reject that field and report both values so the client can
-//     resolve. Other, non-conflicting fields in the same patch still apply.
+// Three-way rules (baseValue present):
+//   1. server == client                       -> noop   (already converged)
+//   2. client == base (client didn't change)  -> noop   (keep server value)
+//   3. server == base (server didn't change)  -> applied (take client value)
+//   4. server != base && client != base       -> conflict (both edited; server wins,
+//                                                 client value returned for re-edit)
 //
-// Reasonable-accommodation fields get an extra guard: a stale draft can never
-// CLEAR an accommodation that the server currently holds. If an incoming edit
-// would blank an accommodation field while the server has a value and the edit
-// is stale, it is treated as a protected conflict rather than silently wiping
-// the accommodation need.
+// Version-based fallback (no baseValue):
+//   * server.updatedAtVersion <= baseVersion  -> applied (server not moved past base)
+//   * otherwise, differing values             -> conflict
+//
+// Reasonable-accommodation fields get an extra guard that supersedes the above:
+// a merge can never CLEAR an accommodation the server currently holds. Any edit
+// that would empty a non-empty accommodation field is returned as a protected
+// conflict rather than silently wiping the need — this covers correction,
+// offline recovery, and duplicate-submit paths equally.
 
 export type StoredValue = string | string[] | null;
 
@@ -32,6 +39,9 @@ export interface IncomingEdit {
   key: ApplicantFieldKey;
   value: StoredValue;
   baseVersion: number;
+  // Optional common-ancestor value enabling true three-way merge. When omitted,
+  // the merge falls back to version-based two-way resolution.
+  baseValue?: StoredValue;
 }
 
 export type FieldMergeStatus = "applied" | "noop" | "conflict";
@@ -43,7 +53,11 @@ export interface FieldMergeResult {
   resolvedValue: StoredValue;
   serverValue: StoredValue;
   incomingValue: StoredValue;
+  // The base (common-ancestor) value used for three-way resolution, if any.
+  baseValue: StoredValue | undefined;
   serverVersion: number;
+  // How the field was resolved: "three-way" or "version".
+  basis: "three-way" | "version";
   // Machine-readable conflict reason for UI + tests.
   conflictReason?: "STALE_EDIT" | "PROTECTED_ACCOMMODATION";
 }
@@ -55,11 +69,17 @@ export interface MergeOutcome {
 }
 
 function normalize(value: StoredValue): string {
-  if (value === null) return "\u0000null";
+  // Treat null, an empty array, and an empty/whitespace string as the same
+  // "empty" value: an absent field row (server default null), a deserialized
+  // empty multi-select ([]), and a blank scalar all mean "unset", so they must
+  // not read as a spurious change during three-way merge.
+  if (value === null) return "\u0000empty";
   if (Array.isArray(value)) {
+    if (value.length === 0) return "\u0000empty";
     // Order-insensitive comparison for multi-select fields.
     return JSON.stringify([...value].map((v) => v).sort());
   }
+  if (value.trim().length === 0) return "\u0000empty";
   return JSON.stringify(value);
 }
 
@@ -78,7 +98,8 @@ function isEmptyValue(value: StoredValue): boolean {
 }
 
 /**
- * Merge one incoming edit against the current stored field.
+ * Merge one incoming edit against the current stored field using three-way
+ * resolution when a base value is available.
  */
 export function mergeField(
   stored: StoredField | undefined,
@@ -86,55 +107,59 @@ export function mergeField(
 ): FieldMergeResult {
   const serverValue: StoredValue = stored?.value ?? null;
   const serverVersion = stored?.updatedAtVersion ?? 0;
+  const hasBaseValue = Object.prototype.hasOwnProperty.call(edit, "baseValue");
+  const basis: FieldMergeResult["basis"] = hasBaseValue ? "three-way" : "version";
 
-  // No divergence since the client last saw this field: accept.
-  if (serverVersion <= edit.baseVersion) {
-    const status: FieldMergeStatus = valuesEqual(serverValue, edit.value) ? "noop" : "applied";
-    return {
-      key: edit.key,
-      status,
-      resolvedValue: edit.value,
-      serverValue,
-      incomingValue: edit.value,
-      serverVersion,
-    };
-  }
-
-  // Server changed since baseVersion. Identical value => already converged.
-  if (valuesEqual(serverValue, edit.value)) {
-    return {
-      key: edit.key,
-      status: "noop",
-      resolvedValue: serverValue,
-      serverValue,
-      incomingValue: edit.value,
-      serverVersion,
-    };
-  }
-
-  // Protected accommodation: a stale edit must not clear a live accommodation.
-  if (isAccommodationField(edit.key) && isEmptyValue(edit.value) && !isEmptyValue(serverValue)) {
-    return {
-      key: edit.key,
-      status: "conflict",
-      resolvedValue: serverValue,
-      serverValue,
-      incomingValue: edit.value,
-      serverVersion,
-      conflictReason: "PROTECTED_ACCOMMODATION",
-    };
-  }
-
-  // Genuine divergent edit to the same field: conflict.
-  return {
+  const result = (
+    status: FieldMergeStatus,
+    resolvedValue: StoredValue,
+    conflictReason?: FieldMergeResult["conflictReason"],
+  ): FieldMergeResult => ({
     key: edit.key,
-    status: "conflict",
-    resolvedValue: serverValue,
+    status,
+    resolvedValue,
     serverValue,
     incomingValue: edit.value,
+    baseValue: hasBaseValue ? edit.baseValue : undefined,
     serverVersion,
-    conflictReason: "STALE_EDIT",
-  };
+    basis,
+    ...(conflictReason ? { conflictReason } : {}),
+  });
+
+  // (0) Already converged: client value equals server value.
+  if (valuesEqual(serverValue, edit.value)) {
+    return result("noop", serverValue);
+  }
+
+  // (Guard) Never clear a live accommodation through a merge. This protects the
+  // reasonable-accommodation need across correction, offline recovery, and
+  // duplicate-submit flows.
+  if (isAccommodationField(edit.key) && isEmptyValue(edit.value) && !isEmptyValue(serverValue)) {
+    return result("conflict", serverValue, "PROTECTED_ACCOMMODATION");
+  }
+
+  if (hasBaseValue) {
+    const serverChanged = !valuesEqual(serverValue, edit.baseValue ?? null);
+    const clientChanged = !valuesEqual(edit.value, edit.baseValue ?? null);
+
+    // (2) Client never actually changed this field relative to its base: keep
+    // the server value (this is how a stale draft avoids clobbering newer data).
+    if (!clientChanged) {
+      return result("noop", serverValue);
+    }
+    // (3) Server untouched since the client's base: safely take the client edit.
+    if (!serverChanged) {
+      return result("applied", edit.value);
+    }
+    // (4) Both sides changed the same field differently: conflict, server wins.
+    return result("conflict", serverValue, "STALE_EDIT");
+  }
+
+  // Version-based fallback (no base value supplied).
+  if (serverVersion <= edit.baseVersion) {
+    return result("applied", edit.value);
+  }
+  return result("conflict", serverValue, "STALE_EDIT");
 }
 
 /**
@@ -152,4 +177,20 @@ export function mergeFields(
     applied: results.filter((r) => r.status === "applied"),
     conflicts: results.filter((r) => r.status === "conflict"),
   };
+}
+
+/**
+ * Compute which applicant fields changed on the server after a given version.
+ * Used to report concurrent changes back to a staff session that acted on an
+ * older base (e.g., the applicant supplemented materials meanwhile).
+ */
+export function fieldsChangedSince(
+  stored: Iterable<StoredField>,
+  sinceVersion: number,
+): ApplicantFieldKey[] {
+  const changed: ApplicantFieldKey[] = [];
+  for (const field of stored) {
+    if (field.updatedAtVersion > sinceVersion) changed.push(field.key);
+  }
+  return changed;
 }

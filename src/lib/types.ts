@@ -37,7 +37,9 @@ export interface FieldMergeSummary {
   serverValue: StoredValue;
   incomingValue: StoredValue;
   resolvedValue: StoredValue;
+  baseValue: StoredValue;
   serverVersion: number;
+  basis: "three-way" | "version";
   conflictReason: "STALE_EDIT" | "PROTECTED_ACCOMMODATION" | null;
 }
 

@@ -149,4 +149,68 @@ test.describe("correction -> resubmit round-trip (two sessions)", () => {
     await expect(summary).toBeFocused();
     await expect(summary).toContainText(/economic hardship/i);
   });
+
+  test("staff amends a correction while the applicant concurrently supplements materials", async ({
+    page,
+    request,
+  }) => {
+    // Bring an application to NEEDS_CORRECTION with a live accommodation.
+    const id = await createApplication(request);
+    const app0 = await getApplication(request, id);
+    const base = app0.version as number;
+    await request.patch(`/api/applications/${id}/draft`, {
+      data: {
+        baseVersion: base,
+        edits: [
+          { key: "fullName", value: "Concurrent Chris", baseVersion: base, baseValue: null },
+          { key: "contactEmail", value: "chris@example.org", baseVersion: base, baseValue: null },
+          { key: "exemptionReason", value: "NONE", baseVersion: base, baseValue: null },
+          { key: "identityProof", value: "ID-META-1", baseVersion: base, baseValue: null },
+          { key: "economicProof", value: "ECON-1", baseVersion: base, baseValue: null },
+          { key: "accommodations", value: ["HOME_VISIT_NEEDED"], baseVersion: base, baseValue: [] },
+        ],
+      },
+    });
+    const submittedVersion = (await getApplication(request, id)).version as number;
+    await request.post(`/api/applications/${id}/submit`, {
+      headers: { "Idempotency-Key": `sub-conc-${id}` },
+      data: { baseVersion: submittedVersion },
+    });
+    await request.post(`/api/staff/applications/${id}/request-correction`, {
+      data: { fields: ["economicProof"], reasonCode: "ECONOMIC_PROOF_REQUIRED" },
+    });
+
+    // Staff session loads the detail page (captures its base version).
+    await page.goto(`/staff/${id}`);
+    await expect(page.getByTestId("status-badge").first()).toHaveAttribute(
+      "data-state",
+      "NEEDS_CORRECTION",
+    );
+
+    // Applicant concurrently supplements the economic proof via the API (a second
+    // session) AFTER staff loaded the page — this advances the server version.
+    const ncVersion = (await getApplication(request, id)).version as number;
+    await request.patch(`/api/applications/${id}/draft`, {
+      data: {
+        baseVersion: ncVersion,
+        edits: [{ key: "economicProof", value: "ECON-2", baseVersion: ncVersion, baseValue: "ECON-1" }],
+      },
+    });
+
+    // Staff now amends the correction from its (stale) page version. The staff
+    // session is told about the concurrent applicant edit.
+    await page.getByTestId("toggle-correction").click();
+    await page.getByLabel("identityProof", { exact: true }).check();
+    await page.getByTestId("submit-correction").click();
+
+    const banner = page.getByTestId("concurrent-banner");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText(/economicProof/);
+
+    // The applicant's supplement and the accommodation both survive.
+    const final = await getApplication(request, id);
+    expect(final.values.economicProof).toBe("ECON-2");
+    expect(final.values.accommodations).toEqual(["HOME_VISIT_NEEDED"]);
+    expect(final.openCorrection?.fields.sort()).toEqual(["economicProof", "identityProof"]);
+  });
 });

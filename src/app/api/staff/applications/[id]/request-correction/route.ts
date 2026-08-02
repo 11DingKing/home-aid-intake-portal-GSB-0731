@@ -13,9 +13,14 @@ const bodySchema = z.object({
     .min(1, "Select at least one field to correct."),
   reasonCode: z.enum(CORRECTION_REASON_CODES),
   note: z.string().max(1000).optional(),
+  // The application version the staff member was looking at. Enables the server
+  // to report the applicant's concurrent field edits back to this session.
+  baseVersion: z.number().int().nonnegative().optional(),
 });
 
 // POST /api/staff/applications/:id/request-correction
+// Returns { application, concurrentFields, amended }. `concurrentFields` are the
+// applicant fields changed after `baseVersion` (staff-side conflict signal).
 export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
@@ -29,8 +34,14 @@ export async function POST(
       throw badRequest("Request body must be valid JSON.");
     }
     const parsed = bodySchema.parse(json);
-    const app = await requestCorrection(id, parsed.fields, parsed.reasonCode, parsed.note);
-    return ok(app);
+    const result = await requestCorrection(
+      id,
+      parsed.fields,
+      parsed.reasonCode,
+      parsed.note,
+      parsed.baseVersion,
+    );
+    return ok(result);
   } catch (err) {
     return errorResponse(err);
   }

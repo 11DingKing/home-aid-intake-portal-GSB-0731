@@ -30,11 +30,15 @@ export default function StaffActions({
   const [reasonCode, setReasonCode] = useState<string>(CORRECTION_REASON_CODES[0]);
   const [note, setNote] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // Applicant fields changed concurrently while this staff session was acting.
+  const [concurrentFields, setConcurrentFields] = useState<string[]>([]);
 
   const actions = allowedActions(state);
   const can = (a: ApplicationAction) => actions.includes(a);
+  // Either a fresh correction (SUBMITTED/RESUBMITTED) or an amend (NEEDS_CORRECTION).
+  const canCorrect = can("requestCorrection") || can("amendCorrection");
 
-  async function post(url: string, body: unknown, successMsg: string) {
+  async function post(url: string, body: unknown, successMsg: string): Promise<unknown | null> {
     setBusy(true);
     setError(null);
     try {
@@ -43,17 +47,20 @@ export default function StaffActions({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
+      const parsed: unknown = await res.json().catch(() => null);
       if (!res.ok) {
-        const b = (await res.json()) as ApiError;
-        setError(b.error?.message ?? "Action failed.");
-        setAnnounce(`Action failed: ${b.error?.message ?? "server error"}`);
-        return;
+        const b = parsed as ApiError | null;
+        setError(b?.error?.message ?? "Action failed.");
+        setAnnounce(`Action failed: ${b?.error?.message ?? "server error"}`);
+        return null;
       }
       setAnnounce(successMsg);
       router.refresh();
+      return parsed;
     } catch {
       setError("Network error.");
       setAnnounce("Network error while performing the action.");
+      return null;
     } finally {
       setBusy(false);
     }
@@ -73,11 +80,20 @@ export default function StaffActions({
       setError("Select at least one field to correct.");
       return;
     }
-    await post(
+    // Send the version the staff member was viewing so the server can report the
+    // applicant's concurrent edits (e.g., materials supplemented meanwhile).
+    const result = await post(
       `/api/staff/applications/${id}/request-correction`,
-      { fields: correctionFields, reasonCode, note: note || undefined },
-      "Correction requested. The applicant can now resubmit.",
+      { fields: correctionFields, reasonCode, note: note || undefined, baseVersion: version },
+      "Correction saved. The applicant can now resubmit.",
     );
+    const concurrent = (result as { concurrentFields?: string[] } | null)?.concurrentFields ?? [];
+    setConcurrentFields(concurrent);
+    if (concurrent.length > 0) {
+      setAnnounce(
+        `Correction saved. Note: the applicant changed ${concurrent.join(", ")} while you were reviewing; those edits were preserved.`,
+      );
+    }
     setShowCorrection(false);
     setCorrectionFields([]);
     setNote("");
@@ -112,6 +128,15 @@ export default function StaffActions({
         </div>
       ) : null}
 
+      {concurrentFields.length > 0 ? (
+        <div className="banner" data-tone="warn" role="status" data-testid="concurrent-banner">
+          <span className="banner-title">Concurrent applicant edits: </span>
+          The applicant changed {concurrentFields.join(", ")} while you were
+          reviewing. Those edits were preserved and merged with your correction —
+          re-check the disclosed fields above.
+        </div>
+      ) : null}
+
       <div className="button-row">
         {can("accept") ? (
           <button type="button" onClick={() => decide("accept")} disabled={busy} data-testid="accept">
@@ -123,7 +148,7 @@ export default function StaffActions({
             Decline
           </button>
         ) : null}
-        {can("requestCorrection") ? (
+        {canCorrect ? (
           <button
             type="button"
             className="secondary"
@@ -132,12 +157,16 @@ export default function StaffActions({
             aria-controls="correction-form"
             data-testid="toggle-correction"
           >
-            {showCorrection ? "Cancel correction" : "Request correction"}
+            {showCorrection
+              ? "Cancel correction"
+              : can("amendCorrection")
+                ? "Amend correction"
+                : "Request correction"}
           </button>
         ) : null}
       </div>
 
-      {showCorrection && can("requestCorrection") ? (
+      {showCorrection && canCorrect ? (
         <form id="correction-form" onSubmit={submitCorrection} style={{ marginTop: "1rem" }}>
           <fieldset>
             <legend className="fieldset-legend">Fields the applicant must correct</legend>

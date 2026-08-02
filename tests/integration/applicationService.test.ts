@@ -109,12 +109,12 @@ describe("application service lifecycle", () => {
       "ECONOMIC_PROOF_REQUIRED",
       "Please re-upload",
     );
-    expect(corrected.state).toBe("NEEDS_CORRECTION");
-    expect(corrected.openCorrection?.fields).toEqual(["economicProof"]);
+    expect(corrected.application.state).toBe("NEEDS_CORRECTION");
+    expect(corrected.application.openCorrection?.fields).toEqual(["economicProof"]);
 
     // Applicant edits the flagged field then resubmits.
-    const fixed = await patchDraft(app.id, corrected.version, [
-      edit("economicProof", "ECON-2", corrected.version),
+    const fixed = await patchDraft(app.id, corrected.application.version, [
+      edit("economicProof", "ECON-2", corrected.application.version),
     ]);
     const resubmitted = await submitApplication(app.id, "resub-1", fixed.application.version);
     expect(resubmitted.application.state).toBe("RESUBMITTED");

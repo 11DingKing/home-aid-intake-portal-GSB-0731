@@ -10,6 +10,7 @@ import {
   APPLICANT_FIELD_KEYS,
   type ApplicantFieldKey,
   type ApplicationState,
+  type MaterialKind,
   type StaffViewName,
   isApplicationState,
 } from "@/domain/constants";
@@ -22,6 +23,7 @@ import {
 } from "@/domain/stateMachine";
 import {
   mergeFields,
+  fieldsChangedSince,
   type FieldMergeResult,
   type IncomingEdit,
   type StoredField,
@@ -425,36 +427,97 @@ export async function staffDecision(
   });
 }
 
+export interface CorrectionResult {
+  application: ApplicationView;
+  // Applicant fields that changed on the server after the staff member's
+  // baseVersion — i.e., the applicant supplemented materials concurrently while
+  // staff was writing the correction. Returned to the STAFF session so it can
+  // reconcile its view. Empty when the staff acted on the latest version.
+  concurrentFields: string[];
+  // Whether this created a new correction or amended within NEEDS_CORRECTION.
+  amended: boolean;
+}
+
+/**
+ * Staff writes (or amends) a correction reason code. This performs a field-level
+ * three-way reconciliation across the concurrent applicant edit:
+ *  - The correction path never writes applicant field VALUES, so a concurrent
+ *    applicant material supplement is preserved untouched (accommodations
+ *    included).
+ *  - If the applicant changed fields after the staff member's `baseVersion`,
+ *    those keys are returned as `concurrentFields` so the staff session sees the
+ *    conflict rather than silently overwriting its mental model.
+ *  - From SUBMITTED/RESUBMITTED it transitions to NEEDS_CORRECTION; from
+ *    NEEDS_CORRECTION it self-loops (amendCorrection) so it is not an illegal
+ *    backward transition while the applicant is still editing.
+ */
 export async function requestCorrection(
   id: string,
   fields: string[],
   reasonCode: string,
   note?: string,
-): Promise<ApplicationView> {
+  baseVersion?: number,
+): Promise<CorrectionResult> {
   return prisma.$transaction(async (tx) => {
-    const app = await tx.application.findUnique({ where: { id } });
+    const app = await tx.application.findUnique({ where: { id }, include: { fields: true } });
     if (!app) throw notFound();
     const state = isApplicationState(app.state) ? app.state : "DRAFT";
-    const toState = assertTransition(state, "requestCorrection");
+
+    // Choose the legal action for the current state: fresh request vs amend.
+    const action: ApplicationAction =
+      state === "NEEDS_CORRECTION" ? "amendCorrection" : "requestCorrection";
+    const toState = assertTransition(state, action);
+
+    // Detect the applicant's concurrent edits relative to the staff base version.
+    const storedFields = toFieldMap(app.fields);
+    const concurrentFields =
+      baseVersion === undefined
+        ? []
+        : fieldsChangedSince(storedFields.values(), baseVersion);
+
+    const newVersion = app.version + 1;
     await tx.application.update({
       where: { id },
       data: {
         state: toState,
-        version: app.version + 1,
+        version: newVersion,
+        // NOTE: no field writes here — applicant values (incl. accommodations)
+        // are deliberately left intact.
         events: {
           create: { fromState: state, toState, actor: "staff", note: reasonCode },
         },
       },
     });
-    await tx.correction.create({
-      data: {
-        applicationId: id,
-        fields: JSON.stringify(fields),
-        reasonCode,
-        note: note ?? null,
-      },
-    });
-    return reloadWithinTx(tx, id);
+
+    if (action === "amendCorrection") {
+      // Merge into the existing open correction: union the flagged fields and
+      // update the reason code, rather than stacking duplicate corrections.
+      const open = await tx.correction.findFirst({
+        where: { applicationId: id, resolvedAt: null },
+        orderBy: { createdAt: "desc" },
+      });
+      if (open) {
+        const merged = Array.from(new Set([...safeParseStringArray(open.fields), ...fields]));
+        await tx.correction.update({
+          where: { id: open.id },
+          data: { fields: JSON.stringify(merged), reasonCode, note: note ?? open.note },
+        });
+      } else {
+        await tx.correction.create({
+          data: { applicationId: id, fields: JSON.stringify(fields), reasonCode, note: note ?? null },
+        });
+      }
+    } else {
+      await tx.correction.create({
+        data: { applicationId: id, fields: JSON.stringify(fields), reasonCode, note: note ?? null },
+      });
+    }
+
+    return {
+      application: await reloadWithinTx(tx, id),
+      concurrentFields,
+      amended: action === "amendCorrection",
+    };
   });
 }
 
@@ -534,7 +597,119 @@ export async function listApplicationsForStaff(): Promise<StaffListItem[]> {
 }
 
 export function availableActions(state: ApplicationState): ApplicationAction[] {
-  return (["submit", "resubmit", "requestCorrection", "accept", "decline"] as ApplicationAction[]).filter(
-    (a) => nextState(state, a) !== null,
-  );
+  return (
+    ["submit", "resubmit", "requestCorrection", "amendCorrection", "accept", "decline"] as ApplicationAction[]
+  ).filter((a) => nextState(state, a) !== null);
+}
+
+// ------- Attachment metadata replacement -----------------------------------
+
+export interface ReplaceMaterialInput {
+  fieldKey: "identityProof" | "economicProof";
+  kind: MaterialKind;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  checksum?: string | null;
+  // Optional explicit metadata id; generated when omitted.
+  materialId?: string;
+}
+
+export interface ReplaceMaterialResult {
+  application: ApplicationView;
+  material: MaterialMetadataView;
+  replacedMaterialId: string | null;
+}
+
+/**
+ * Replace the attachment metadata bound to a material field (identityProof or
+ * economicProof). This writes ONLY metadata (never bytes): it creates a new
+ * MaterialMetadata row, points the field at it via the field-merge path, and
+ * detaches the previously referenced metadata. It never touches accommodation
+ * fields, so a reasonable-accommodation need is preserved across a document swap.
+ * Editable only in DRAFT / NEEDS_CORRECTION.
+ */
+export async function replaceMaterial(
+  id: string,
+  input: ReplaceMaterialInput,
+): Promise<ReplaceMaterialResult> {
+  return prisma.$transaction(async (tx) => {
+    const app = await tx.application.findUnique({ where: { id }, include: { fields: true } });
+    if (!app) throw notFound();
+    const state = isApplicationState(app.state) ? app.state : "DRAFT";
+    if (!canEditFields(state)) {
+      throw new AppError("NOT_EDITABLE", `Materials cannot be replaced in state ${state}.`, 409, {
+        state,
+      });
+    }
+
+    const fieldMap = toFieldMap(app.fields);
+    const previousRef = fieldMap.get(input.fieldKey)?.value ?? null;
+    const previousId = typeof previousRef === "string" && previousRef.trim() !== "" ? previousRef : null;
+
+    const newVersion = app.version + 1;
+    const materialId = input.materialId ?? `MAT-${newApplicationId().slice(4)}-${Date.now().toString(36)}`;
+
+    // Create the new metadata row (metadata only).
+    const created = await tx.materialMetadata.create({
+      data: {
+        id: materialId,
+        applicationId: id,
+        kind: input.kind,
+        filename: input.filename,
+        mimeType: input.mimeType,
+        sizeBytes: input.sizeBytes,
+        checksum: input.checksum ?? null,
+      },
+    });
+
+    // Point the field at the new metadata id, bumping the field's version so a
+    // concurrent stale edit to this field would three-way-conflict.
+    await tx.applicationField.upsert({
+      where: { applicationId_key: { applicationId: id, key: input.fieldKey } },
+      create: {
+        applicationId: id,
+        key: input.fieldKey,
+        value: materialId,
+        updatedAtVersion: newVersion,
+      },
+      update: { value: materialId, updatedAtVersion: newVersion },
+    });
+
+    // Detach the previously referenced metadata (if any and now unreferenced).
+    if (previousId && previousId !== materialId) {
+      await tx.materialMetadata.updateMany({
+        where: { id: previousId, applicationId: id },
+        data: { applicationId: null },
+      });
+    }
+
+    await tx.application.update({
+      where: { id },
+      data: {
+        version: newVersion,
+        events: {
+          create: {
+            fromState: state,
+            toState: state,
+            actor: "applicant",
+            note: `material:replace:${input.fieldKey}`,
+          },
+        },
+      },
+    });
+
+    return {
+      application: await reloadWithinTx(tx, id),
+      material: {
+        id: created.id,
+        kind: created.kind,
+        filename: created.filename,
+        mimeType: created.mimeType,
+        sizeBytes: created.sizeBytes,
+        uploadedAt: created.uploadedAt.toISOString(),
+      },
+      replacedMaterialId: previousId,
+    };
+  });
 }
