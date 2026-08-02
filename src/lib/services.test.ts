@@ -3,8 +3,10 @@ import { PrismaClient } from "@prisma/client";
 import { join } from "node:path";
 import {
   ApiError,
+  replaceMaterialMetadata,
   resubmitApplication,
   saveDraft,
+  saveStaffCorrection,
   staffTransition,
   submitApplication,
 } from "./services";
@@ -225,5 +227,135 @@ describe("补正与工作人员流转", () => {
     await expect(
       staffTransition(prisma, "APP-T12", "ACCEPT", {}),
     ).rejects.toBeInstanceOf(ApiError);
+  });
+});
+
+describe("saveStaffCorrection 三方合并", () => {
+  async function createNeedsCorrection(id: string) {
+    await createDraft(id);
+    await fillValid(id);
+    await submitApplication(prisma, id, `key-${id}`);
+    await staffTransition(prisma, id, "REQUEST_CORRECTION", {
+      fields: ["economicProof"],
+      reasonCode: "ECONOMIC_PROOF_REQUIRED",
+      note: "请补正",
+    });
+    const app = await prisma.application.findUniqueOrThrow({ where: { id } });
+    return app;
+  }
+
+  it("基于同一旧草稿：申请人补材料/改字段 与 工作人员写 reason code 各自生效", async () => {
+    const app = await createNeedsCorrection("APP-T20");
+    const base = app.version;
+    // 申请人基于 base 改地址
+    await saveDraft(prisma, "APP-T20", base, { address: "申请人新地址 9 号" });
+    // 工作人员仍基于同一 base 写补正 → 不同字段域，互不冲突
+    const result = await saveStaffCorrection(prisma, "APP-T20", base, {
+      reasonCode: "ECONOMIC_PROOF_UPDATED",
+      note: "请上传最新证明",
+    });
+    expect(result.conflicts).toHaveLength(0);
+    expect(result.correction.reasonCode).toBe("ECONOMIC_PROOF_UPDATED");
+    // 申请人的修改原样保留
+    const fresh = await prisma.application.findUniqueOrThrow({ where: { id: "APP-T20" } });
+    expect(fresh.address).toBe("申请人新地址 9 号");
+    // 合理便利不受影响
+    expect(JSON.parse(fresh.accommodations)).toEqual(["HOME_VISIT_NEEDED"]);
+  });
+
+  it("两个工作人员会话改同一 reason code：后者收到冲突且服务端优先", async () => {
+    const app = await createNeedsCorrection("APP-T21");
+    const base = app.version;
+    const first = await saveStaffCorrection(prisma, "APP-T21", base, {
+      reasonCode: "STAFF_A_CODE",
+    });
+    expect(first.conflicts).toHaveLength(0);
+    const second = await saveStaffCorrection(prisma, "APP-T21", base, {
+      reasonCode: "STAFF_B_CODE",
+    });
+    expect(second.conflicts).toHaveLength(1);
+    expect(second.conflicts[0]).toMatchObject({
+      field: "correctionReasonCode",
+      serverValue: "STAFF_A_CODE",
+      clientValue: "STAFF_B_CODE",
+    });
+    expect(second.correction.reasonCode).toBe("STAFF_A_CODE");
+  });
+
+  it("非 NEEDS_CORRECTION 状态拒绝编辑补正", async () => {
+    await createDraft("APP-T22");
+    await expect(
+      saveStaffCorrection(prisma, "APP-T22", 1, { reasonCode: "X" }),
+    ).rejects.toMatchObject({ status: 409, code: "STATE_CONFLICT" });
+  });
+
+  it("重复提交/补正流程全程不清空合理便利", async () => {
+    await createNeedsCorrection("APP-T23");
+    // 重复提交同一幂等键
+    const dup = await submitApplication(prisma, "APP-T23", `key-APP-T23`);
+    expect(dup.duplicate).toBe(true);
+    // 重新提交后合理便利仍在
+    await resubmitApplication(prisma, "APP-T23", "key-APP-T23b");
+    const fresh = await prisma.application.findUniqueOrThrow({ where: { id: "APP-T23" } });
+    expect(fresh.state).toBe("RESUBMITTED");
+    expect(JSON.parse(fresh.accommodations)).toEqual(["HOME_VISIT_NEEDED"]);
+  });
+});
+
+describe("replaceMaterialMetadata", () => {
+  it("替换元数据保留材料 ID 与种类并递增版本", async () => {
+    await createDraft("APP-T30");
+    await fillValid("APP-T30");
+    const before = await prisma.material.findUniqueOrThrow({ where: { id: "APP-T30-ECON" } });
+    const updated = await replaceMaterialMetadata(prisma, "APP-T30", "APP-T30-ECON", {
+      metadata: { fileName: "new-proof.pdf", size: 999 },
+    });
+    const after = updated.materials.find((m) => m.id === "APP-T30-ECON")!;
+    expect(after.id).toBe(before.id);
+    expect(after.kind).toBe("ECONOMIC_PROOF");
+    expect(JSON.parse(after.metadata)).toMatchObject({ fileName: "new-proof.pdf", size: 999 });
+    expect(updated.version).toBeGreaterThan(before.createdAt ? 0 : 0);
+  });
+
+  it("已提交申请拒绝替换材料", async () => {
+    await createDraft("APP-T31");
+    await fillValid("APP-T31");
+    await submitApplication(prisma, "APP-T31", "key-t31");
+    await expect(
+      replaceMaterialMetadata(prisma, "APP-T31", "APP-T31-ECON", { metadata: {} }),
+    ).rejects.toMatchObject({ status: 409, code: "DRAFT_LOCKED" });
+  });
+
+  it("跨申请的材料 ID 拒绝替换", async () => {
+    await createDraft("APP-T32");
+    await fillValid("APP-T32");
+    await expect(
+      replaceMaterialMetadata(prisma, "APP-T32", "APP-T30-ECON", { metadata: {} }),
+    ).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe("非法状态回退", () => {
+  it("ACCEPTED 不能回退到任何状态；SUBMITTED 不能回到 DRAFT", async () => {
+    await createDraft("APP-T40");
+    await fillValid("APP-T40");
+    await submitApplication(prisma, "APP-T40", "key-t40");
+    // SUBMITTED 上不能再 SUBMIT（异键）
+    await expect(submitApplication(prisma, "APP-T40", "other-key")).rejects.toMatchObject({
+      status: 409,
+      code: "STATE_CONFLICT",
+    });
+    // SUBMITTED 不能编辑草稿（回退 DRAFT）
+    await expect(saveDraft(prisma, "APP-T40", 2, { contactName: "X" })).rejects.toMatchObject({
+      status: 409,
+    });
+    await staffTransition(prisma, "APP-T40", "ACCEPT", {});
+    await expect(staffTransition(prisma, "APP-T40", "REQUEST_CORRECTION", {
+      fields: ["economicProof"],
+      reasonCode: "R",
+    })).rejects.toMatchObject({ status: 409 });
+    await expect(resubmitApplication(prisma, "APP-T40", "k")).rejects.toMatchObject({
+      status: 409,
+    });
   });
 });

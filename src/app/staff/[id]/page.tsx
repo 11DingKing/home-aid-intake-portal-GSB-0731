@@ -1,9 +1,14 @@
 import Link from "next/link";
 import { prisma } from "@/lib/db";
-import { isStaffView, projectForStaffView, type StaffView } from "@/lib/disclosure";
+import {
+  isStaffView,
+  projectForStaffView,
+  type StaffView,
+} from "@/lib/disclosure";
 import type { AppState } from "@/lib/constants";
 import { StatusBadge } from "@/components/StatusBadge";
 import { StaffActions } from "./StaffActions";
+import { StaffCorrectionEditor } from "./StaffCorrectionEditor";
 
 export const dynamic = "force-dynamic";
 
@@ -11,6 +16,15 @@ const VIEW_LABELS: Record<StaffView, string> = {
   INTAKE_REVIEW: "受理初审视图",
   CORRECTION_REVIEW: "补正复核视图",
 };
+
+function safeStringArray(raw: string): string[] {
+  try {
+    const v: unknown = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
 
 export default async function StaffDetailPage({
   params,
@@ -41,7 +55,10 @@ export default async function StaffDetailPage({
     );
   }
 
-  const projected = projectForStaffView({ ...app, state: app.state as AppState }, view);
+  const projected = projectForStaffView(
+    { ...app, state: app.state as AppState },
+    view,
+  );
   const actionable = app.state === "SUBMITTED" || app.state === "RESUBMITTED";
 
   return (
@@ -82,7 +99,24 @@ export default async function StaffDetailPage({
         </dl>
       </section>
 
-      <StaffActions id={app.id} state={app.state as AppState} view={view} actionable={actionable} />
+      <StaffActions
+        id={app.id}
+        state={app.state as AppState}
+        view={view}
+        actionable={actionable}
+      />
+
+      {app.state === "NEEDS_CORRECTION" && app.corrections[0] ? (
+        <StaffCorrectionEditor
+          id={app.id}
+          initialVersion={app.version}
+          initial={{
+            fields: safeStringArray(app.corrections[0].fields),
+            reasonCode: app.corrections[0].reasonCode,
+            note: app.corrections[0].note,
+          }}
+        />
+      ) : null}
 
       <p>
         <Link href={`/staff?view=${view}`}>返回列表</Link>

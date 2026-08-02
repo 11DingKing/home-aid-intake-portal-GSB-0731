@@ -126,6 +126,9 @@ export function ApplyWizard({ initial }: { initial: ApplicantView }) {
   const headingRef = useRef<HTMLHeadingElement>(null);
   const summaryRef = useRef<HTMLDivElement>(null);
   const restoredRef = useRef(false);
+  const correctionRef = useRef<string | null>(
+    JSON.stringify(initial.latestCorrection),
+  );
 
   const updateFields = useCallback((next: Fields) => {
     fieldsRef.current = next;
@@ -145,6 +148,21 @@ export function ApplyWizard({ initial }: { initial: ApplicantView }) {
       baseVersionRef.current = view.version;
       setMaterials(view.materials);
       setAppState(view.state);
+      // 工作人员更新补正要求时向申请人公告（补正、合并、冲突都不得清空合理便利）。
+      const prevCorrection = correctionRef.current;
+      const nextCorrection = JSON.stringify(view.latestCorrection);
+      if (
+        prevCorrection !== null &&
+        prevCorrection !== nextCorrection &&
+        view.latestCorrection
+      ) {
+        announce(
+          `工作人员更新了补正要求：${view.latestCorrection.fields
+            .map((f) => FIELD_LABELS[f] ?? f)
+            .join("、")}（${view.latestCorrection.reasonCode}）`,
+        );
+      }
+      correctionRef.current = nextCorrection;
       setLatestCorrection(view.latestCorrection);
       let nextFields = fieldsRef.current;
       if (overwriteAllFields) {
@@ -481,6 +499,29 @@ export function ApplyWizard({ initial }: { initial: ApplicantView }) {
     }
   }
 
+  /** 替换材料元数据（保留材料 ID 与种类），例如重新选择证明文件。 */
+  async function replaceMaterial(
+    materialId: string,
+    label: string,
+    meta: Record<string, unknown>,
+  ) {
+    const res = await fetch(
+      `/api/applications/${initial.id}/materials/${materialId}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ metadata: meta }),
+      },
+    );
+    if (res.ok) {
+      const view = (await res.json()) as ApplicantView;
+      applyServerView(view, [], false);
+      announce(`已替换材料 ${label} 的文件元数据`);
+    } else {
+      announce("替换材料失败，请重试");
+    }
+  }
+
   const exemption = fields.exemptionReason as ExemptionReason;
   const economicProofExempt = !requiresEconomicProof(exemption);
   const errorCount = Object.keys(errors).length;
@@ -691,6 +732,7 @@ export function ApplyWizard({ initial }: { initial: ApplicantView }) {
                 errors={errors}
                 onAdd={addMaterial}
                 onRemove={removeMaterial}
+                onReplace={replaceMaterial}
               />
             ) : null}
 
@@ -863,6 +905,7 @@ function MaterialsStep({
   errors,
   onAdd,
   onRemove,
+  onReplace,
 }: {
   materials: ApplicantView["materials"];
   economicProofExempt: boolean;
@@ -874,6 +917,11 @@ function MaterialsStep({
     meta: Record<string, unknown>,
   ) => Promise<void>;
   onRemove: (id: string, label: string) => Promise<void>;
+  onReplace: (
+    id: string,
+    label: string,
+    meta: Record<string, unknown>,
+  ) => Promise<void>;
 }) {
   const [kind, setKind] = useState<MaterialKind>("IDENTITY");
   const [label, setLabel] = useState("");
@@ -909,7 +957,7 @@ function MaterialsStep({
 
       <ul className="materials-list" aria-label="已登记材料">
         {materials.map((m) => (
-          <li key={m.id} data-material-kind={m.kind}>
+          <li key={m.id} data-material-kind={m.kind} data-material-id={m.id}>
             <span>
               <strong>{MATERIAL_KIND_LABELS[m.kind as MaterialKind]}</strong>：
               {m.label}
@@ -917,14 +965,41 @@ function MaterialsStep({
                 ? `（${m.metadata.fileName}）`
                 : ""}
             </span>
-            <button
-              type="button"
-              className="btn danger"
-              aria-label={`删除材料 ${m.label}`}
-              onClick={() => void onRemove(m.id, m.label)}
-            >
-              删除
-            </button>
+            <span className="btn-row" style={{ margin: 0 }}>
+              <label
+                className="btn secondary"
+                style={{ cursor: "pointer" }}
+                htmlFor={`replace-${m.id}`}
+              >
+                替换文件
+              </label>
+              <input
+                id={`replace-${m.id}`}
+                type="file"
+                className="sr-only"
+                aria-label={`替换材料 ${m.label} 的文件`}
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) {
+                    void onReplace(m.id, m.label, {
+                      fileName: f.name,
+                      size: f.size,
+                      mimeType: f.type || "application/octet-stream",
+                      uploadedAt: new Date().toISOString(),
+                    });
+                    e.target.value = "";
+                  }
+                }}
+              />
+              <button
+                type="button"
+                className="btn danger"
+                aria-label={`删除材料 ${m.label}`}
+                onClick={() => void onRemove(m.id, m.label)}
+              >
+                删除
+              </button>
+            </span>
           </li>
         ))}
         {materials.length === 0 ? <li>尚未登记材料</li> : null}

@@ -85,6 +85,17 @@ export const EDITABLE_FIELDS = [
 ] as const;
 export type EditableField = (typeof EDITABLE_FIELDS)[number];
 
+/**
+ * 工作人员补正伪字段：与申请人字段共用同一乐观版本合并域，
+ * 使“申请人补材料 × 工作人员写补正”基于同一旧草稿做字段级三方合并。
+ */
+export const CORRECTION_FIELDS = [
+  "correctionFields",
+  "correctionReasonCode",
+  "correctionNote",
+] as const;
+export type CorrectionField = (typeof CORRECTION_FIELDS)[number];
+
 export const FIELD_LABELS: Record<string, string> = {
   contactName: "姓名",
   contactPhone: "联系电话",
@@ -95,4 +106,7 @@ export const FIELD_LABELS: Record<string, string> = {
   accommodations: "合理便利需求",
   economicProof: "经济困难证明",
   identity: "身份证明",
+  correctionFields: "补正字段",
+  correctionReasonCode: "补正原因代码",
+  correctionNote: "补正备注",
 };

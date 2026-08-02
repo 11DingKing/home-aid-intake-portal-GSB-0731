@@ -1,7 +1,16 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
 import type { AppState, EditableField } from "./constants";
-import { parseFieldVersions, mergeDraftFields, type MergeConflict } from "./merge";
-import { nextState, StateTransitionError, type TransitionAction } from "./state-machine";
+import { CORRECTION_FIELDS } from "./constants";
+import {
+  parseFieldVersions,
+  mergeDraftFields,
+  type MergeConflict,
+} from "./merge";
+import {
+  nextState,
+  StateTransitionError,
+  type TransitionAction,
+} from "./state-machine";
 import {
   parseAccommodations,
   validateForSubmit,
@@ -14,7 +23,12 @@ export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
   readonly details?: unknown;
-  constructor(status: number, code: string, message: string, details?: unknown) {
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    details?: unknown,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
@@ -28,10 +42,15 @@ const includeRels = {
   corrections: { orderBy: { createdAt: "desc" as const }, take: 1 },
 } satisfies Prisma.ApplicationInclude;
 
-type ApplicationWithRels = Prisma.ApplicationGetPayload<{ include: typeof includeRels }>;
+type ApplicationWithRels = Prisma.ApplicationGetPayload<{
+  include: typeof includeRels;
+}>;
 
 async function mustGet(tx: Tx, id: string): Promise<ApplicationWithRels> {
-  const app = await tx.application.findUnique({ where: { id }, include: includeRels });
+  const app = await tx.application.findUnique({
+    where: { id },
+    include: includeRels,
+  });
   if (!app) throw new ApiError(404, "NOT_FOUND", `申请 ${id} 不存在`);
   return app;
 }
@@ -82,7 +101,9 @@ function safeObject(raw: string): Record<string, unknown> {
 function safeStringArray(raw: string): string[] {
   try {
     const v: unknown = JSON.parse(raw);
-    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+    return Array.isArray(v)
+      ? v.filter((x): x is string => typeof x === "string")
+      : [];
   } catch {
     return [];
   }
@@ -147,15 +168,138 @@ export async function saveDraft(
     include: includeRels,
   });
 
-  const conflicts = merge.conflicts.map((c) => ({
-    ...c,
-    serverValue:
-      c.field === "accommodations"
-        ? parseAccommodations(updated.accommodations)
-        : String(updated[c.field as Exclude<EditableField, "accommodations">]),
-  }));
+  return { application: updated, conflicts: merge.conflicts };
+}
 
-  return { application: updated, conflicts };
+export interface StaffCorrectionPatch {
+  fields?: string[];
+  reasonCode?: string;
+  note?: string;
+}
+
+export interface StaffCorrectionResult {
+  version: number;
+  state: AppState;
+  correction: { fields: string[]; reasonCode: string; note: string };
+  conflicts: MergeConflict[];
+}
+
+/**
+ * 工作人员编辑补正要求：与申请人草稿共用同一乐观版本合并域。
+ * 基于同一旧草稿时——申请人改字段/补材料、工作人员写补正 reason code
+ * 互不冲突、各自生效；两个工作人员会话改同一补正伪字段则冲突，
+ * 服务端值获胜并把冲突字段返回给对应会话。合理便利等申请人字段不受影响。
+ */
+export async function saveStaffCorrection(
+  tx: Tx,
+  id: string,
+  baseVersion: number,
+  patch: StaffCorrectionPatch,
+): Promise<StaffCorrectionResult> {
+  const app = await mustGet(tx, id);
+  const state = app.state as AppState;
+  if (state !== "NEEDS_CORRECTION") {
+    throw new ApiError(
+      409,
+      "STATE_CONFLICT",
+      `当前状态 ${state} 没有可编辑的补正要求`,
+    );
+  }
+  if (!Number.isInteger(baseVersion) || baseVersion < 0) {
+    throw new ApiError(400, "BAD_VERSION", "baseVersion 必须是非负整数");
+  }
+  const latest = app.corrections[0];
+  if (!latest) {
+    throw new ApiError(409, "NO_CORRECTION", "该申请没有补正记录");
+  }
+
+  const serverFields: Record<string, unknown> = {
+    correctionFields: safeStringArray(latest.fields),
+    correctionReasonCode: latest.reasonCode,
+    correctionNote: latest.note,
+  };
+  const pseudoPatch: Record<string, unknown> = {};
+  if (patch.fields !== undefined) pseudoPatch.correctionFields = patch.fields;
+  if (patch.reasonCode !== undefined)
+    pseudoPatch.correctionReasonCode = patch.reasonCode;
+  if (patch.note !== undefined) pseudoPatch.correctionNote = patch.note;
+
+  const fieldVersions = parseFieldVersions(app.fieldVersions);
+  const merge = mergeDraftFields({
+    serverVersion: app.version,
+    serverFields,
+    fieldVersions,
+    baseVersion,
+    patch: pseudoPatch,
+    allowedFields: CORRECTION_FIELDS,
+  });
+
+  if (Object.keys(merge.applied).length > 0) {
+    await tx.correction.update({
+      where: { id: latest.id },
+      data: {
+        fields: JSON.stringify(
+          merge.applied.correctionFields ?? serverFields.correctionFields,
+        ),
+        reasonCode: String(
+          merge.applied.correctionReasonCode ??
+            serverFields.correctionReasonCode,
+        ),
+        note: String(
+          merge.applied.correctionNote ?? serverFields.correctionNote,
+        ),
+      },
+    });
+  }
+  const updated = await tx.application.update({
+    where: { id },
+    data: {
+      version: app.version + 1,
+      fieldVersions: JSON.stringify(merge.newFieldVersions),
+    },
+    include: includeRels,
+  });
+  const updatedLatest = updated.corrections[0]!;
+  return {
+    version: updated.version,
+    state: updated.state as AppState,
+    correction: {
+      fields: safeStringArray(updatedLatest.fields),
+      reasonCode: updatedLatest.reasonCode,
+      note: updatedLatest.note,
+    },
+    conflicts: merge.conflicts,
+  };
+}
+
+/** 替换材料元数据（保留材料 ID 与种类，整体替换 metadata，可改 label）。 */
+export async function replaceMaterialMetadata(
+  tx: Tx,
+  id: string,
+  materialId: string,
+  patch: { label?: string; metadata: Record<string, unknown> },
+): Promise<ApplicationWithRels> {
+  const app = await mustGet(tx, id);
+  const state = app.state as AppState;
+  if (!DRAFT_EDITABLE_STATES.includes(state)) {
+    throw new ApiError(409, "DRAFT_LOCKED", `当前状态 ${state} 不可修改材料`);
+  }
+  const material = await tx.material.findUnique({ where: { id: materialId } });
+  if (!material || material.applicationId !== id) {
+    throw new ApiError(404, "NOT_FOUND", `材料 ${materialId} 不存在`);
+  }
+  await tx.material.update({
+    where: { id: materialId },
+    data: {
+      label: patch.label ?? material.label,
+      metadata: JSON.stringify(patch.metadata),
+    },
+  });
+  return tx.application.update({
+    where: { id },
+    data: { version: { increment: 1 } },
+    include: includeRels,
+  });
 }
 
 export interface SubmitResult {
@@ -184,14 +328,18 @@ export async function submitApplication(
   if (state !== "DRAFT") {
     throw new ApiError(409, "STATE_CONFLICT", `当前状态 ${state} 不能提交`);
   }
-  const keyOwner = await tx.application.findUnique({ where: { idempotencyKey } });
+  const keyOwner = await tx.application.findUnique({
+    where: { idempotencyKey },
+  });
   if (keyOwner && keyOwner.id !== id) {
     throw new ApiError(409, "DUPLICATE_KEY", "幂等键已被其他申请使用");
   }
 
   const fieldErrors = validateForSubmit(app, app.materials);
   if (Object.keys(fieldErrors).length > 0) {
-    throw new ApiError(422, "VALIDATION_FAILED", "提交校验未通过", { fieldErrors });
+    throw new ApiError(422, "VALIDATION_FAILED", "提交校验未通过", {
+      fieldErrors,
+    });
   }
 
   const to = nextState("DRAFT", "SUBMIT");
@@ -213,7 +361,12 @@ export async function submitApplication(
     throw new ApiError(409, "STATE_CONFLICT", "申请已被提交");
   }
   await tx.applicationEvent.create({
-    data: { applicationId: id, fromState: "DRAFT", toState: to, actor: "APPLICANT" },
+    data: {
+      applicationId: id,
+      fromState: "DRAFT",
+      toState: to,
+      actor: "APPLICANT",
+    },
   });
   return { application: await mustGet(tx, id), duplicate: false };
 }
@@ -239,16 +392,28 @@ export async function resubmitApplication(
 
   const fieldErrors = validateForSubmit(app, app.materials);
   if (Object.keys(fieldErrors).length > 0) {
-    throw new ApiError(422, "VALIDATION_FAILED", "提交校验未通过", { fieldErrors });
+    throw new ApiError(422, "VALIDATION_FAILED", "提交校验未通过", {
+      fieldErrors,
+    });
   }
 
   const to = nextState("NEEDS_CORRECTION", "RESUBMIT");
   await tx.application.update({
     where: { id },
-    data: { state: to, idempotencyKey, submittedAt: new Date(), version: { increment: 1 } },
+    data: {
+      state: to,
+      idempotencyKey,
+      submittedAt: new Date(),
+      version: { increment: 1 },
+    },
   });
   await tx.applicationEvent.create({
-    data: { applicationId: id, fromState: "NEEDS_CORRECTION", toState: to, actor: "APPLICANT" },
+    data: {
+      applicationId: id,
+      fromState: "NEEDS_CORRECTION",
+      toState: to,
+      actor: "APPLICANT",
+    },
   });
   return { application: await mustGet(tx, id), duplicate: false };
 }
@@ -275,7 +440,11 @@ export async function staffTransition(
 
   if (action === "REQUEST_CORRECTION") {
     if (!payload.fields?.length || !payload.reasonCode) {
-      throw new ApiError(400, "BAD_CORRECTION", "请求补正必须包含 fields 与 reasonCode");
+      throw new ApiError(
+        400,
+        "BAD_CORRECTION",
+        "请求补正必须包含 fields 与 reasonCode",
+      );
     }
     await tx.correction.create({
       data: {

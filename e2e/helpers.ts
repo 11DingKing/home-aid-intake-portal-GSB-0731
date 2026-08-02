@@ -81,7 +81,41 @@ export async function submitApp(
   id: string,
   idempotencyKey: string,
 ) {
-  return request.post(`/api/applications/${id}/submit`, {
-    data: { idempotencyKey },
+  return request.post(`/api/applications/${id}/submit`, { data: { idempotencyKey } });
+}
+
+export async function staffTransition(
+  request: APIRequestContext,
+  id: string,
+  action: string,
+  payload: Record<string, unknown> = {},
+) {
+  return request.post(`/api/staff/applications/${id}/transition`, {
+    data: { action, ...payload },
   });
+}
+
+/**
+ * 创建一份 NEEDS_CORRECTION 申请：资料齐全提交后被工作人员退回补正
+ * （economicProof / ECONOMIC_PROOF_REQUIRED）。返回最新视图（含版本号）。
+ */
+export async function createNeedsCorrection(
+  request: APIRequestContext,
+  accommodations: string[] = ["HOME_VISIT_NEEDED"],
+): Promise<AppView> {
+  const app = await createApp(request);
+  await patchDraft(request, app.id, app.version, { ...VALID_FIELDS, accommodations });
+  let view = await addMaterial(request, app.id, "IDENTITY", "身份证复印件");
+  view = await addMaterial(request, app.id, "ECONOMIC_PROOF", "经济困难证明");
+  const sub = await submitApp(request, app.id, `nc-${app.id}`);
+  if (!sub.ok()) throw new Error(`submit failed: ${sub.status()}`);
+  const corr = await staffTransition(request, app.id, "REQUEST_CORRECTION", {
+    fields: ["economicProof"],
+    reasonCode: "ECONOMIC_PROOF_REQUIRED",
+    note: "证明已过期，请重新上传",
+  });
+  if (!corr.ok()) throw new Error(`correction failed: ${corr.status()}`);
+  view = await getApp(request, app.id);
+  if (view.state !== "NEEDS_CORRECTION") throw new Error(`unexpected state ${view.state}`);
+  return view;
 }

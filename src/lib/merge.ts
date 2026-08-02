@@ -1,24 +1,25 @@
-import { EDITABLE_FIELDS, type EditableField } from "./constants";
+import { EDITABLE_FIELDS } from "./constants";
 
 export interface MergeConflict {
-  field: EditableField;
+  field: string;
   serverValue: unknown;
   clientValue: unknown;
 }
 
 export interface MergeResult {
-  applied: Partial<Record<EditableField, unknown>>;
+  applied: Record<string, unknown>;
   conflicts: MergeConflict[];
   newFieldVersions: Record<string, number>;
 }
 
 /**
- * 字段级三路合并：客户端基于 baseVersion 的离线编辑与服务端当前值合并。
+ * 字段级三路合并：某会话基于 baseVersion 的编辑与服务端当前值合并。
  * 对每个被修改的字段：
  * - 值与服务端相同 → 跳过（不刷新字段版本，避免全量上送造成假冲突）；
  * - 服务端在 baseVersion 之后改过该字段（fieldVersions[field] > baseVersion）
  *   → 记为冲突并以服务端值为准；
- * - 否则应用客户端值并刷新字段版本。
+ * - 否则应用该值并刷新字段版本。
+ * 申请人与工作人员共用同一合并域（申请人字段 + 补正伪字段），
  * 合理便利等字段因此不会被旧草稿静默覆盖。
  */
 export function mergeDraftFields(opts: {
@@ -27,16 +28,23 @@ export function mergeDraftFields(opts: {
   fieldVersions: Record<string, number>;
   baseVersion: number;
   patch: Record<string, unknown>;
+  allowedFields?: readonly string[];
 }): MergeResult {
-  const { serverVersion, serverFields, fieldVersions, baseVersion, patch } =
-    opts;
-  const applied: Partial<Record<EditableField, unknown>> = {};
+  const {
+    serverVersion,
+    serverFields,
+    fieldVersions,
+    baseVersion,
+    patch,
+    allowedFields = EDITABLE_FIELDS,
+  } = opts;
+  const applied: Record<string, unknown> = {};
   const conflicts: MergeConflict[] = [];
   const newFieldVersions: Record<string, number> = { ...fieldVersions };
 
   for (const key of Object.keys(patch)) {
-    if (!(EDITABLE_FIELDS as readonly string[]).includes(key)) continue;
-    const field = key as EditableField;
+    if (!allowedFields.includes(key)) continue;
+    const field = key;
     if (JSON.stringify(patch[field]) === JSON.stringify(serverFields[field]))
       continue;
     const serverFieldVersion = fieldVersions[field] ?? 0;
