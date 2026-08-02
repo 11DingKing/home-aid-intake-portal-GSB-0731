@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAnnouncer } from "@/components/Announcer";
 import { FIELD_LABELS } from "@/lib/constants";
 
@@ -48,6 +48,17 @@ export function StaffCorrectionEditor({
   const [conflicts, setConflicts] = useState<ConflictInfo[]>([]);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const conflictRef = useRef<HTMLDivElement>(null);
+  const messageRef = useRef<HTMLParagraphElement>(null);
+
+  // 焦点恢复：冲突时焦点移到冲突提示，否则移到结果消息。
+  useEffect(() => {
+    if (conflicts.length > 0) {
+      conflictRef.current?.focus();
+    } else if (message) {
+      messageRef.current?.focus();
+    }
+  }, [conflicts, message]);
 
   async function save() {
     setBusy(true);
@@ -85,6 +96,8 @@ export function StaffCorrectionEditor({
         router.refresh();
       } else {
         setMessage(body.error?.message ?? "保存失败");
+        // 状态可能已被其他会话推进（旧链接）：刷新以按最新状态重新计算可见性
+        router.refresh();
       }
     } catch {
       setMessage("网络异常，保存未完成");
@@ -102,7 +115,13 @@ export function StaffCorrectionEditor({
       </p>
 
       {conflicts.length > 0 ? (
-        <div className="notice warn" role="alert" data-testid="staff-conflict-notice">
+        <div
+          className="notice warn"
+          role="alert"
+          tabIndex={-1}
+          ref={conflictRef}
+          data-testid="staff-conflict-notice"
+        >
           冲突字段（已回显为服务器版本）：
           <ul>
             {conflicts.map((c) => (
@@ -161,7 +180,13 @@ export function StaffCorrectionEditor({
         保存补正要求
       </button>
       {message ? (
-        <p className="notice" role="status" data-testid="correction-save-result">
+        <p
+          className="notice"
+          role="status"
+          tabIndex={-1}
+          ref={messageRef}
+          data-testid="correction-save-result"
+        >
           {message}
         </p>
       ) : null}

@@ -1,6 +1,7 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
 import type { AppState, EditableField } from "./constants";
 import { CORRECTION_FIELDS } from "./constants";
+import { writableFieldsFor, type Role } from "./policy";
 import {
   parseFieldVersions,
   mergeDraftFields,
@@ -55,12 +56,17 @@ async function mustGet(tx: Tx, id: string): Promise<ApplicationWithRels> {
   return app;
 }
 
-/** 申请人视角的完整自有数据。 */
+/** 申请人视角的完整自有数据。permissions 由服务端按状态×角色每次重新计算。 */
 export function serializeApplicantView(app: ApplicationWithRels) {
+  const state = app.state as AppState;
   return {
     id: app.id,
     version: app.version,
-    state: app.state as AppState,
+    state,
+    permissions: {
+      editable: writableFieldsFor("APPLICANT", state).length > 0,
+      writableFields: [...writableFieldsFor("APPLICANT", state)],
+    },
     fields: {
       contactName: app.contactName,
       contactPhone: app.contactPhone,
@@ -474,4 +480,29 @@ export async function staffTransition(
 
 export function materialFieldErrors(app: ApplicationWithRels): FieldErrors {
   return validateForSubmit(app, app.materials);
+}
+
+/**
+ * 记录可审计的拒绝理由（越权字段、非法状态操作）。
+ * 在失败事务之外独立写入，保证回滚不影响审计轨迹。
+ */
+export async function recordRejection(
+  client: Tx,
+  applicationId: string,
+  actor: Role,
+  reason: string,
+): Promise<void> {
+  const app = await client.application.findUnique({
+    where: { id: applicationId },
+  });
+  if (!app) return;
+  await client.applicationEvent.create({
+    data: {
+      applicationId,
+      fromState: app.state,
+      toState: app.state,
+      actor,
+      note: reason,
+    },
+  });
 }

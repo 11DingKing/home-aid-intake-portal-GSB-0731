@@ -76,13 +76,21 @@ export default async function StaffPage({
         <tbody>
           {items.map((item) => {
             const state = item.state as AppState;
+            const notApplicable = item.viewNotApplicable === true;
             return (
               <tr key={item.id as string}>
                 <td>{item.id as string}</td>
                 <td>
                   <StatusBadge state={state} />
                 </td>
-                {view === "INTAKE_REVIEW" ? (
+                {notApplicable ? (
+                  <td
+                    colSpan={view === "INTAKE_REVIEW" ? 3 : 2}
+                    className="hint"
+                  >
+                    此状态不适用本视图（最小披露）
+                  </td>
+                ) : view === "INTAKE_REVIEW" ? (
                   <>
                     <td>{String(item.exemptionReason ?? "")}</td>
                     <td>

@@ -3,6 +3,7 @@ import { PrismaClient } from "@prisma/client";
 import { join } from "node:path";
 import {
   ApiError,
+  recordRejection,
   replaceMaterialMetadata,
   resubmitApplication,
   saveDraft,
@@ -257,7 +258,9 @@ describe("saveStaffCorrection 三方合并", () => {
     expect(result.conflicts).toHaveLength(0);
     expect(result.correction.reasonCode).toBe("ECONOMIC_PROOF_UPDATED");
     // 申请人的修改原样保留
-    const fresh = await prisma.application.findUniqueOrThrow({ where: { id: "APP-T20" } });
+    const fresh = await prisma.application.findUniqueOrThrow({
+      where: { id: "APP-T20" },
+    });
     expect(fresh.address).toBe("申请人新地址 9 号");
     // 合理便利不受影响
     expect(JSON.parse(fresh.accommodations)).toEqual(["HOME_VISIT_NEEDED"]);
@@ -296,7 +299,9 @@ describe("saveStaffCorrection 三方合并", () => {
     expect(dup.duplicate).toBe(true);
     // 重新提交后合理便利仍在
     await resubmitApplication(prisma, "APP-T23", "key-APP-T23b");
-    const fresh = await prisma.application.findUniqueOrThrow({ where: { id: "APP-T23" } });
+    const fresh = await prisma.application.findUniqueOrThrow({
+      where: { id: "APP-T23" },
+    });
     expect(fresh.state).toBe("RESUBMITTED");
     expect(JSON.parse(fresh.accommodations)).toEqual(["HOME_VISIT_NEEDED"]);
   });
@@ -306,14 +311,24 @@ describe("replaceMaterialMetadata", () => {
   it("替换元数据保留材料 ID 与种类并递增版本", async () => {
     await createDraft("APP-T30");
     await fillValid("APP-T30");
-    const before = await prisma.material.findUniqueOrThrow({ where: { id: "APP-T30-ECON" } });
-    const updated = await replaceMaterialMetadata(prisma, "APP-T30", "APP-T30-ECON", {
-      metadata: { fileName: "new-proof.pdf", size: 999 },
+    const before = await prisma.material.findUniqueOrThrow({
+      where: { id: "APP-T30-ECON" },
     });
+    const updated = await replaceMaterialMetadata(
+      prisma,
+      "APP-T30",
+      "APP-T30-ECON",
+      {
+        metadata: { fileName: "new-proof.pdf", size: 999 },
+      },
+    );
     const after = updated.materials.find((m) => m.id === "APP-T30-ECON")!;
     expect(after.id).toBe(before.id);
     expect(after.kind).toBe("ECONOMIC_PROOF");
-    expect(JSON.parse(after.metadata)).toMatchObject({ fileName: "new-proof.pdf", size: 999 });
+    expect(JSON.parse(after.metadata)).toMatchObject({
+      fileName: "new-proof.pdf",
+      size: 999,
+    });
     expect(updated.version).toBeGreaterThan(before.createdAt ? 0 : 0);
   });
 
@@ -322,7 +337,9 @@ describe("replaceMaterialMetadata", () => {
     await fillValid("APP-T31");
     await submitApplication(prisma, "APP-T31", "key-t31");
     await expect(
-      replaceMaterialMetadata(prisma, "APP-T31", "APP-T31-ECON", { metadata: {} }),
+      replaceMaterialMetadata(prisma, "APP-T31", "APP-T31-ECON", {
+        metadata: {},
+      }),
     ).rejects.toMatchObject({ status: 409, code: "DRAFT_LOCKED" });
   });
 
@@ -330,7 +347,9 @@ describe("replaceMaterialMetadata", () => {
     await createDraft("APP-T32");
     await fillValid("APP-T32");
     await expect(
-      replaceMaterialMetadata(prisma, "APP-T32", "APP-T30-ECON", { metadata: {} }),
+      replaceMaterialMetadata(prisma, "APP-T32", "APP-T30-ECON", {
+        metadata: {},
+      }),
     ).rejects.toMatchObject({ status: 404 });
   });
 });
@@ -341,21 +360,80 @@ describe("非法状态回退", () => {
     await fillValid("APP-T40");
     await submitApplication(prisma, "APP-T40", "key-t40");
     // SUBMITTED 上不能再 SUBMIT（异键）
-    await expect(submitApplication(prisma, "APP-T40", "other-key")).rejects.toMatchObject({
+    await expect(
+      submitApplication(prisma, "APP-T40", "other-key"),
+    ).rejects.toMatchObject({
       status: 409,
       code: "STATE_CONFLICT",
     });
     // SUBMITTED 不能编辑草稿（回退 DRAFT）
-    await expect(saveDraft(prisma, "APP-T40", 2, { contactName: "X" })).rejects.toMatchObject({
+    await expect(
+      saveDraft(prisma, "APP-T40", 2, { contactName: "X" }),
+    ).rejects.toMatchObject({
       status: 409,
     });
     await staffTransition(prisma, "APP-T40", "ACCEPT", {});
-    await expect(staffTransition(prisma, "APP-T40", "REQUEST_CORRECTION", {
-      fields: ["economicProof"],
-      reasonCode: "R",
-    })).rejects.toMatchObject({ status: 409 });
-    await expect(resubmitApplication(prisma, "APP-T40", "k")).rejects.toMatchObject({
+    await expect(
+      staffTransition(prisma, "APP-T40", "REQUEST_CORRECTION", {
+        fields: ["economicProof"],
+        reasonCode: "R",
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+    await expect(
+      resubmitApplication(prisma, "APP-T40", "k"),
+    ).rejects.toMatchObject({
       status: 409,
     });
+  });
+});
+
+describe("recordRejection 审计", () => {
+  it("拒绝理由写入事件流，含角色与理由，不改动状态", async () => {
+    await createDraft("APP-T50");
+    await recordRejection(
+      prisma,
+      "APP-T50",
+      "APPLICANT",
+      "FIELD_FORBIDDEN: 测试拒绝 [state]",
+    );
+    await recordRejection(
+      prisma,
+      "APP-T50",
+      "STAFF",
+      "STATE_CONFLICT: 测试拒绝",
+    );
+    const events = await prisma.applicationEvent.findMany({
+      where: { applicationId: "APP-T50" },
+      orderBy: { createdAt: "asc" },
+    });
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({
+      actor: "APPLICANT",
+      fromState: "DRAFT",
+      toState: "DRAFT",
+      note: "FIELD_FORBIDDEN: 测试拒绝 [state]",
+    });
+    expect(events[1].actor).toBe("STAFF");
+    // 状态未被改动
+    const app = await prisma.application.findUniqueOrThrow({
+      where: { id: "APP-T50" },
+    });
+    expect(app.state).toBe("DRAFT");
+  });
+
+  it("serializeApplicantView 的 permissions 按状态重新计算", async () => {
+    await createDraft("APP-T51");
+    const draft = await prisma.application.findUniqueOrThrow({
+      where: { id: "APP-T51" },
+      include: { materials: true, corrections: true },
+    });
+    const { serializeApplicantView } = await import("./services");
+    const v1 = serializeApplicantView(draft);
+    expect(v1.permissions.editable).toBe(true);
+    expect(v1.permissions.writableFields).toContain("accommodations");
+    const submitted = { ...draft, state: "SUBMITTED" };
+    const v2 = serializeApplicantView(submitted);
+    expect(v2.permissions.editable).toBe(false);
+    expect(v2.permissions.writableFields).toEqual([]);
   });
 });

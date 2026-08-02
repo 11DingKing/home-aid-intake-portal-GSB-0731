@@ -3,17 +3,36 @@ import { prisma } from "@/lib/db";
 import { jsonError, readJson } from "@/lib/api-helpers";
 import {
   ApiError,
+  recordRejection,
   resubmitApplication,
   serializeApplicantView,
 } from "@/lib/services";
+import { fieldForbiddenReason, findRejectedFields } from "@/lib/policy";
+import type { AppState } from "@/lib/constants";
 
 type Ctx = { params: Promise<{ id: string }> };
 
-/** 补正后重新提交（NEEDS_CORRECTION → RESUBMITTED），幂等键去重。 */
+/** 补正后重新提交（NEEDS_CORRECTION → RESUBMITTED），幂等键去重。白名单外字段整体拒绝并审计。 */
 export async function POST(request: Request, ctx: Ctx) {
+  const { id } = await ctx.params;
   try {
-    const { id } = await ctx.params;
     const body = await readJson(request);
+    const app = await prisma.application.findUnique({ where: { id } });
+    if (!app) throw new ApiError(404, "NOT_FOUND", `申请 ${id} 不存在`);
+
+    const rejected = findRejectedFields(Object.keys(body), ["idempotencyKey"]);
+    if (rejected.length > 0) {
+      const reason = fieldForbiddenReason(
+        "APPLICANT",
+        app.state as AppState,
+        rejected,
+      );
+      await recordRejection(prisma, id, "APPLICANT", reason);
+      throw new ApiError(403, "FIELD_FORBIDDEN", reason, {
+        rejectedFields: rejected,
+      });
+    }
+
     const idempotencyKey =
       typeof body.idempotencyKey === "string"
         ? body.idempotencyKey
@@ -21,16 +40,23 @@ export async function POST(request: Request, ctx: Ctx) {
     if (!idempotencyKey) {
       throw new ApiError(400, "BAD_IDEMPOTENCY_KEY", "缺少 idempotencyKey");
     }
-    const result = await prisma.$transaction((tx) =>
-      resubmitApplication(tx, id, idempotencyKey),
-    );
-    return NextResponse.json(
-      {
-        ...serializeApplicantView(result.application),
-        duplicate: result.duplicate,
-      },
-      { status: result.duplicate ? 200 : 201 },
-    );
+    try {
+      const result = await prisma.$transaction((tx) =>
+        resubmitApplication(tx, id, idempotencyKey),
+      );
+      return NextResponse.json(
+        {
+          ...serializeApplicantView(result.application),
+          duplicate: result.duplicate,
+        },
+        { status: result.duplicate ? 200 : 201 },
+      );
+    } catch (e) {
+      if (e instanceof ApiError && e.code === "STATE_CONFLICT") {
+        await recordRejection(prisma, id, "APPLICANT", e.message);
+      }
+      throw e;
+    }
   } catch (e) {
     return jsonError(e);
   }

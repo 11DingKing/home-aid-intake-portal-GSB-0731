@@ -20,7 +20,9 @@ const VIEW_LABELS: Record<StaffView, string> = {
 function safeStringArray(raw: string): string[] {
   try {
     const v: unknown = JSON.parse(raw);
-    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+    return Array.isArray(v)
+      ? v.filter((x): x is string => typeof x === "string")
+      : [];
   } catch {
     return [];
   }
@@ -42,6 +44,7 @@ export default async function StaffDetailPage({
     include: {
       materials: true,
       corrections: { orderBy: { createdAt: "desc" }, take: 1 },
+      events: { orderBy: { createdAt: "desc" }, take: 20 },
     },
   });
 
@@ -81,6 +84,16 @@ export default async function StaffDetailPage({
 
       <section className="card" aria-labelledby="projected-heading">
         <h2 id="projected-heading">可见字段</h2>
+        {projected.viewNotApplicable === true ? (
+          <p
+            className="notice warn"
+            role="note"
+            data-testid="view-not-applicable"
+          >
+            申请当前状态为「{app.state}
+            」，此视图不适用；按最小披露只显示编号与状态。
+          </p>
+        ) : null}
         <dl>
           {Object.entries(projected).map(([key, value]) => (
             <div key={key} style={{ marginBlock: "0.5rem" }}>
@@ -117,6 +130,22 @@ export default async function StaffDetailPage({
           }}
         />
       ) : null}
+
+      <section className="card" aria-labelledby="audit-heading">
+        <h2 id="audit-heading">审计记录</h2>
+        <ul data-testid="audit-log">
+          {app.events.map((e) => (
+            <li key={e.id}>
+              <time dateTime={e.createdAt.toISOString()}>
+                {e.createdAt.toISOString().slice(0, 19).replace("T", " ")}
+              </time>{" "}
+              {e.actor}：{e.fromState} → {e.toState}
+              {e.note ? `（${e.note}）` : ""}
+            </li>
+          ))}
+          {app.events.length === 0 ? <li>暂无记录</li> : null}
+        </ul>
+      </section>
 
       <p>
         <Link href={`/staff?view=${view}`}>返回列表</Link>

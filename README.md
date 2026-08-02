@@ -77,10 +77,26 @@ RESUBMITTED 同样可 REQUEST_CORRECTION / ACCEPT / DECLINE ┘
 `src/lib/disclosure.ts` 的 `projectForStaffView` 在服务端响应前裁剪字段，
 越权字段不会离开服务器（页面与 API 同一投影函数）：
 
-| 视图                            | 可见字段                                                                                              |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `INTAKE_REVIEW`（受理初审）     | `id`, `state`, `exemptionReason`, `materialMetadata`, `accommodations`                                |
-| `CORRECTION_REVIEW`（补正复核） | `id`, `state`, `correctionFields`, `submittedFieldMetadata`（仅 present/length 等元数据，绝无原始值） |
+| 视图                            | 适用状态                                      | 可见字段                                                                                              |
+| ------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `INTAKE_REVIEW`（受理初审）     | SUBMITTED / RESUBMITTED / ACCEPTED / DECLINED | `id`, `state`, `exemptionReason`, `materialMetadata`, `accommodations`                                |
+| `CORRECTION_REVIEW`（补正复核） | NEEDS_CORRECTION / RESUBMITTED                | `id`, `state`, `correctionFields`, `submittedFieldMetadata`（仅 present/length 等元数据，绝无原始值） |
+
+状态超出视图适用范围时只回 `id` + `state` + `viewNotApplicable`（字段级接续边界）。
+
+## 补正权限边界与审计
+
+- 每次加载与提交都在服务端按**状态 × 角色 × 字段白名单**重新计算
+  （`src/lib/policy.ts`），不信任客户端缓存：
+  - 申请人：`DRAFT` / `NEEDS_CORRECTION` 可写 `EDITABLE_FIELDS`，其余状态只读
+    （GET 响应附 `permissions`，同样服务端重算）；
+  - 工作人员：仅 `NEEDS_CORRECTION` 可写补正伪字段（`CORRECTION_FIELDS`）。
+- 草稿 / 补正 / 状态操作 / 提交接口均拒绝白名单外字段：HTTP 403
+  `FIELD_FORBIDDEN` 并**整体拒绝**（夹带的合法字段也不生效），
+  合理便利需求因此无法被恶意清空。
+- 拒绝理由写入 `ApplicationEvent`（`FIELD_FORBIDDEN` / `STATE_CONFLICT` + 角色 +
+  字段名），独立于失败事务落库；`GET /api/staff/applications/{id}/audit`
+  与工作人员页面“审计记录”区可查阅。
 
 工作人员操作：`POST /api/staff/applications/{id}/transition`
 （`REQUEST_CORRECTION` 需 `fields` + `reasonCode`；`ACCEPT` / `DECLINE`）。
@@ -99,6 +115,7 @@ RESUBMITTED 同样可 REQUEST_CORRECTION / ACCEPT / DECLINE ┘
 | GET   | `/api/staff/applications[?view=]` / `/api/staff/applications/{id}[?view=]` | 最小披露列表/详情                      |
 | POST  | `/api/staff/applications/{id}/transition`                                  | 工作人员状态操作                       |
 | PATCH | `/api/staff/applications/{id}/correction`                                  | 编辑补正要求（baseVersion + 三方合并） |
+| GET   | `/api/staff/applications/{id}/audit`                                       | 审计轨迹（状态流转 + 拒绝理由）        |
 
 错误响应统一为 `{ error: { code, message, details } }`；校验失败为
 HTTP 422 + `details.fieldErrors`（字段名 → 中文错误说明）。
@@ -119,18 +136,19 @@ HTTP 422 + `details.fieldErrors`（字段名 → 中文错误说明）。
 
 `npm run test:e2e`（`e2e/`，workers=1，global-setup 自动重置并播种 dev.db）：
 
-| 用例                             | 覆盖                                                                                                                                                             |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `offline-draft.spec.ts`          | 离线填写→本机暂存→重开页面恢复并合并，断线公告                                                                                                                   |
-| `merge-conflict.spec.ts`         | **双浏览器会话**同基线字段级合并冲突（服务端优先、旧草稿不清合理便利）；服务端已受理时客户端整体收敛                                                             |
-| `correction-concurrency.spec.ts` | **申请人与工作人员基于同一旧草稿并发修改**：申请人补材料 × 工作人员写补正 reason code 三方合并各自生效；两个工作人员会话改同一 reason code，冲突字段返回对应会话 |
-| `duplicate-submit.spec.ts`       | UI 提交后同键再提交返回首次结果；并发同键双提交恰好一次生效                                                                                                      |
-| `timeout-retry.spec.ts`          | 提交已在服务端成功但浏览器超时，重试被幂等去重、界面收敛不重复流转                                                                                               |
-| `illegal-transition.spec.ts`     | 非法状态回退：SUBMITTED 回退草稿/异键再提交、ACCEPTED 终态只读、DRAFT 直接受理/补正、NEEDS_CORRECTION 走首次提交通道，均 409                                     |
-| `correction-resubmit.spec.ts`    | APP-202 补正提示→材料错误焦点→补交证明→重新提交；`NO_FIXED_INCOME` 免交经济困难证明且其他材料规则照常                                                            |
-| `material-replace.spec.ts`       | 补正中替换附件元数据：ID/种类不变、元数据更新、版本递增、合理便利保留，替换后重新提交成功                                                                        |
-| `staff-disclosure.spec.ts`       | 两个视图的最小披露（API 键白名单 + 页面无越权值）；受理操作；非颜色状态徽标                                                                                      |
-| `a11y.spec.ts`                   | 错误焦点恢复、控件名称/错误关联、纯键盘第一步、SR 公告区语义、断线恢复公告、跳过链接                                                                             |
+| 用例                             | 覆盖                                                                                                                                                                    |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- |
+| `offline-draft.spec.ts`          | 离线填写→本机暂存→重开页面恢复并合并，断线公告                                                                                                                          |
+| `merge-conflict.spec.ts`         | **双浏览器会话**同基线字段级合并冲突（服务端优先、旧草稿不清合理便利）；服务端已受理时客户端整体收敛                                                                    |
+| `correction-concurrency.spec.ts` | **申请人与工作人员基于同一旧草稿并发修改**：申请人补材料 × 工作人员写补正 reason code 三方合并各自生效；两个工作人员会话改同一 reason code，冲突字段返回对应会话        |
+| `duplicate-submit.spec.ts`       | UI 提交后同键再提交返回首次结果；并发同键双提交恰好一次生效                                                                                                             |
+| `timeout-retry.spec.ts`          | 提交已在服务端成功但浏览器超时，重试被幂等去重、界面收敛不重复流转                                                                                                      |
+| `illegal-transition.spec.ts`     | 非法状态回退：SUBMITTED 回退草稿/异键再提交、ACCEPTED 终态只读、DRAFT 直接受理/补正、NEEDS_CORRECTION 走首次提交通道，均 409                                            |
+| `correction-resubmit.spec.ts`    | APP-202 补正提示→材料错误焦点→补交证明→重新提交；`NO_FIXED_INCOME` 免交经济困难证明且其他材料规则照常                                                                   |
+| `material-replace.spec.ts`       | 补正中替换附件元数据：ID/种类不变、元数据更新、版本递增、合理便利保留，替换后重新提交成功                                                                               |
+| `boundary.spec.ts`               | 切换瞬间旧链接（写入 409、编辑器消失、理由可审计）；恶意隐藏字段提交（403 整体拒绝、合理便利不动、审计理由）；双浏览器焦点恢复；视图随状态重算（越权字段不进 HTML/API） |     |
+| `staff-disclosure.spec.ts`       | 两个视图的最小披露（API 键白名单 + 页面无越权值）；受理操作；非颜色状态徽标                                                                                             |
+| `a11y.spec.ts`                   | 错误焦点恢复、控件名称/错误关联、纯键盘第一步、SR 公告区语义、断线恢复公告、跳过链接                                                                                    |
 
 种子数据（`prisma/seed.ts`）严格来自 `materials/application-cases.json`：
 APP-201（`NO_FIXED_INCOME`，免交证明，已提交）、APP-202（`NONE`，缺经济困难证明，

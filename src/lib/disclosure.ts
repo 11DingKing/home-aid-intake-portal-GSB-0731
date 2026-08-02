@@ -19,6 +19,15 @@ export const STAFF_VIEWS: Record<StaffView, readonly string[]> = {
   ],
 };
 
+/**
+ * 视图的状态适用范围：只有当前步骤真正需要该视图时才暴露其字段，
+ * 否则只回 id + state + viewNotApplicable（字段级接续边界）。
+ */
+export const STAFF_VIEW_SCOPE: Record<StaffView, readonly AppState[]> = {
+  INTAKE_REVIEW: ["SUBMITTED", "RESUBMITTED", "ACCEPTED", "DECLINED"],
+  CORRECTION_REVIEW: ["NEEDS_CORRECTION", "RESUBMITTED"],
+};
+
 export interface StaffProjectionSource {
   id: string;
   state: AppState;
@@ -77,6 +86,10 @@ export function projectForStaffView(
   app: StaffProjectionSource,
   view: StaffView,
 ): Record<string, unknown> {
+  // 状态超出视图适用范围：只暴露 id + state（每次请求在服务端重新计算）。
+  if (!STAFF_VIEW_SCOPE[view].includes(app.state)) {
+    return { id: app.id, state: app.state, viewNotApplicable: true };
+  }
   if (view === "INTAKE_REVIEW") {
     return {
       id: app.id,
