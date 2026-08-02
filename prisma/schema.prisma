@@ -1,0 +1,55 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Application {
+  id                String   @id
+  state             String   @default("DRAFT")
+  exemptionReason   String   @default("NONE")
+  fullName          String?
+  contactPhone      String?
+  contactEmail      String?
+  caseDescription   String?
+  legalIssueType    String?
+  accommodations    String   @default("[]")
+  economicProofMeta String?
+  idDocumentMeta    String?
+  otherMaterialMeta String?
+  version           Int      @default(1)
+  idempotencyKey    String?  @unique
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  submittedAt       DateTime?
+  corrections       Correction[]
+  auditLogs         AuditLog[]
+
+  @@index([state])
+}
+
+model Correction {
+  id            Int      @id @default(autoincrement())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  fields        String
+  reasonCode    String
+  resolved      Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  resolvedAt    DateTime?
+}
+
+model AuditLog {
+  id            Int      @id @default(autoincrement())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  action        String
+  fromState     String?
+  toState       String?
+  actor         String   @default("SYSTEM")
+  details       String?
+  createdAt     DateTime @default(now())
+}
