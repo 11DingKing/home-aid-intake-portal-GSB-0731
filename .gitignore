@@ -6,4 +6,7 @@ prisma/*.db
 *.log
 .env*
 !.env.example
-
+test-results/
+playwright-report/
+next-env.d.ts
+tsconfig.tsbuildinfo

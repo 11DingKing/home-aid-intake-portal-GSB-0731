@@ -1,0 +1,61 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Application {
+  id                String   @id
+  version           Int      @default(0)
+  state             String   @default("DRAFT")
+  contactName       String   @default("")
+  contactPhone      String   @default("")
+  address           String   @default("")
+  matterType        String   @default("")
+  matterDescription String   @default("")
+  exemptionReason   String   @default("NONE")
+  accommodations    String   @default("[]")
+  fieldVersions     String   @default("{}")
+  idempotencyKey    String?  @unique
+  submittedAt       DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  materials   Material[]
+  corrections Correction[]
+  events      ApplicationEvent[]
+}
+
+model Material {
+  id            String      @id
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  kind          String
+  label         String
+  metadata      String      @default("{}")
+  createdAt     DateTime    @default(now())
+}
+
+model Correction {
+  id            String      @id @default(cuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  fields        String
+  reasonCode    String
+  note          String      @default("")
+  createdAt     DateTime    @default(now())
+}
+
+model ApplicationEvent {
+  id            String      @id @default(cuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  fromState     String
+  toState       String
+  actor         String
+  note          String      @default("")
+  createdAt     DateTime    @default(now())
+}

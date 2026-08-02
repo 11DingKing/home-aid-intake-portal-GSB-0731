@@ -1,0 +1,33 @@
+{
+  "name": "home-aid-intake-portal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "prisma generate && next build",
+    "start": "next start",
+    "postinstall": "prisma generate",
+    "db:push": "prisma db push",
+    "db:seed": "node --experimental-strip-types prisma/seed.ts",
+    "test": "npm run db:test:setup && vitest run",
+    "db:test:setup": "DATABASE_URL=\"file:./test.db\" prisma db push --force-reset --skip-generate",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.2.1",
+    "next": "^15.1.6",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.1",
+    "@types/node": "^22.10.5",
+    "@types/react": "^19.0.4",
+    "@types/react-dom": "^19.0.2",
+    "prisma": "^6.2.1",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}
