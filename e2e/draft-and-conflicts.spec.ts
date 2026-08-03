@@ -1,4 +1,4 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Page, type APIRequestContext } from "@playwright/test";
 
 function makeId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -7,6 +7,14 @@ function makeId(prefix: string) {
 async function fillPersonalInfo(page: Page, name: string, phone: string) {
   await page.fill("#fullName", name);
   await page.fill("#contactPhone", phone);
+}
+
+async function seedDraft(request: APIRequestContext, id: string, data: Record<string, unknown>) {
+  await request.post("http://localhost:3000/api/applications", { data: { id } });
+  const app = await (await request.get(`http://localhost:3000/api/applications/${id}`)).json();
+  await request.put(`http://localhost:3000/api/applications/${id}`, {
+    data: { ...data, version: app.data.version },
+  });
 }
 
 test.describe("Offline draft recovery", () => {
@@ -111,33 +119,33 @@ test.describe("Offline draft recovery", () => {
 });
 
 test.describe("Field-level merge conflicts", () => {
-  test("same base version with different field edits merges correctly", async ({ browser }) => {
-    const context1 = await browser.newContext();
-    const context2 = await browser.newContext();
-    const page1 = await context1.newPage();
-    const page2 = await context2.newPage();
-
+  test("same base version with different field edits merges correctly", async ({ browser, request }) => {
     const appId = makeId("E2E-MERGE");
+    await seedDraft(request, appId, {
+      fullName: "会话A用户",
+      contactPhone: "13800000000",
+    });
+
+    const context1 = await browser.newContext();
+    const page1 = await context1.newPage();
 
     await page1.goto(`/apply/${appId}`);
-    await page2.goto(`/apply/${appId}`);
-    await page1.waitForTimeout(2500);
-    await page2.waitForTimeout(2500);
+    await page1.waitForTimeout(2000);
 
-    await page1.fill("#fullName", "会话A用户");
-    await page1.waitForTimeout(3000);
-
-    await page2.fill("#contactPhone", "13811112222");
-    await page2.waitForTimeout(3000);
+    const app = await (await request.get(`http://localhost:3000/api/applications/${appId}`)).json();
+    await request.put(`http://localhost:3000/api/applications/${appId}`, {
+      data: { contactPhone: "13811112222", version: app.data.version },
+    });
 
     await page1.reload();
-    await page1.waitForTimeout(3000);
+    await page1.waitForTimeout(2500);
 
     const name = await page1.inputValue("#fullName");
     expect(name).toBe("会话A用户");
+    const phone = await page1.inputValue("#contactPhone");
+    expect(phone).toBe("13811112222");
 
     await context1.close();
-    await context2.close();
   });
 
   test("server accepted while client remains draft - conflict detected and merged", async ({ page }) => {

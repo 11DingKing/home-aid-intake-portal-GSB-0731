@@ -18,15 +18,15 @@ interface ApplicationDetail {
   id: string;
   state: string;
   exemptionReason: string;
-  fullName: string | null;
-  contactPhone: string | null;
-  contactEmail: string | null;
-  caseDescription: string | null;
-  legalIssueType: string | null;
+  fullName?: string | null;
+  contactPhone?: string | null;
+  contactEmail?: string | null;
+  caseDescription?: string | null;
+  legalIssueType?: string | null;
   accommodations: string[];
-  economicProofMeta: { fileName: string; materialId: string } | null;
-  idDocumentMeta: { fileName: string; materialId: string } | null;
-  otherMaterialMeta: { fileName: string; materialId: string } | null;
+  economicProofMeta?: { fileName: string; materialId: string } | null;
+  idDocumentMeta?: { fileName: string; materialId: string } | null;
+  otherMaterialMeta?: { fileName: string; materialId: string } | null;
   version: number;
 }
 
@@ -65,16 +65,31 @@ export default function StaffDetailPage({ params }: { params: { id: string } }) 
   const [reasonCode, setReasonCode] = useState<string>("INCOMPLETE_INFORMATION");
   const [error, setError] = useState("");
 
-  const loadData = useCallback(async () => {
+  const [staleLinkMessage, setStaleLinkMessage] = useState("");
+
+  const loadData = useCallback(async (expectedState?: string) => {
     setLoading(true);
     try {
-      const [appRes, corrRes] = await Promise.all([
-        fetch(`/api/applications/${params.id}`, { cache: "no-store" }),
+      const url = `/api/applications/${params.id}/fields?role=STAFF${
+        expectedState ? `&expectedState=${expectedState}` : ""
+      }`;
+      const [fieldsRes, corrRes] = await Promise.all([
+        fetch(url, { cache: "no-store" }),
         fetch(`/api/applications/${params.id}/corrections`, { cache: "no-store" }),
       ]);
-      if (appRes.ok) {
-        const appJson = await appRes.json();
-        setApp(appJson.data);
+      if (fieldsRes.ok) {
+        const fieldsJson = await fieldsRes.json();
+        const data = fieldsJson.data;
+        setApp(data.application);
+        if (data.staleLink) {
+          setStaleLinkMessage(data.staleLink.message);
+          setAnnouncement(data.staleLink.message);
+        } else {
+          setStaleLinkMessage("");
+        }
+      } else if (fieldsRes.status === 403) {
+        const json = await fieldsRes.json().catch(() => ({}));
+        setError(json.error || "当前状态不允许查看");
       }
       if (corrRes.ok) {
         const corrJson = await corrRes.json();
@@ -170,6 +185,20 @@ export default function StaffDetailPage({ params }: { params: { id: string } }) 
         <br />
         <span>版本号：v{app.version}</span>
       </div>
+
+      {staleLinkMessage && (
+        <div className="alert alert-warning" role="alert">
+          <span aria-hidden="true">⚠️</span> {staleLinkMessage}
+          <button
+            type="button"
+            className="btn btn-secondary"
+            style={{ marginLeft: "12px", padding: "4px 12px", fontSize: "0.875rem" }}
+            onClick={() => loadData()}
+          >
+            刷新
+          </button>
+        </div>
+      )}
 
       <div className="card">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "12px" }}>

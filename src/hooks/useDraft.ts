@@ -185,10 +185,12 @@ export function useDraft(initialId?: string): UseDraftReturn {
             const serverState = fromApplicationData(serverApp, corrections);
             let merged: DraftState;
 
-            if (currentLocal.id === id) {
-              merged = threeWayMergeClient({ ...currentLocal }, serverState);
-            } else {
+            if (currentLocal.id !== id) {
               merged = serverState;
+            } else if (currentLocal.baseVersion < serverApp.version) {
+              merged = mergeServerOverStaleLocal(currentLocal, serverState);
+            } else {
+              merged = threeWayMergeClient({ ...currentLocal }, serverState);
             }
 
             saveToStorage(merged);
@@ -520,6 +522,35 @@ function threeWayMergeClient(local: DraftState, server: DraftState): DraftState 
     server.otherMaterialMeta &&
     !valuesEqual(local.otherMaterialMeta, server.otherMaterialMeta)
   )
+    merged.otherMaterialMeta = local.otherMaterialMeta;
+
+  merged.version = server.version;
+  merged.baseVersion = server.version;
+  merged.state = server.state;
+  merged.activeCorrections = server.activeCorrections;
+
+  return merged;
+}
+
+function mergeServerOverStaleLocal(local: DraftState, server: DraftState): DraftState {
+  const merged: DraftState = { ...server };
+
+  merged.accommodations = Array.from(
+    new Set([...local.accommodations, ...server.accommodations])
+  ) as Accommodation[];
+
+  if (local.fullName && !server.fullName) merged.fullName = local.fullName;
+  if (local.contactPhone && !server.contactPhone) merged.contactPhone = local.contactPhone;
+  if (local.contactEmail && !server.contactEmail) merged.contactEmail = local.contactEmail;
+  if (local.caseDescription && !server.caseDescription)
+    merged.caseDescription = local.caseDescription;
+  if (local.legalIssueType && !server.legalIssueType)
+    merged.legalIssueType = local.legalIssueType;
+  if (local.economicProofMeta && !server.economicProofMeta)
+    merged.economicProofMeta = local.economicProofMeta;
+  if (local.idDocumentMeta && !server.idDocumentMeta)
+    merged.idDocumentMeta = local.idDocumentMeta;
+  if (local.otherMaterialMeta && !server.otherMaterialMeta)
     merged.otherMaterialMeta = local.otherMaterialMeta;
 
   merged.version = server.version;

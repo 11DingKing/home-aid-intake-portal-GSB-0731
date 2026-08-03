@@ -1,17 +1,20 @@
 import { prisma } from "@/lib/prisma";
 import { serializeApplication, serializeCorrection } from "@/lib/serializers";
 import { apiSuccess } from "@/lib/api-response";
-import { STAFF_VIEW_FIELDS, type ApplicationData, type StaffViewType } from "@/domain/types";
+import { getStaffVisibleFields, getStaffViewForState } from "@/domain/field-permissions";
+import type { ApplicationData } from "@/domain/types";
 
 function projectToStaffView(
   app: ApplicationData,
-  view: StaffViewType,
   corrections: ReturnType<typeof serializeCorrection>[]
 ) {
-  const fields = STAFF_VIEW_FIELDS[view];
+  const view = getStaffViewForState(app.state);
+  if (view === "NONE") return null;
+
+  const visibleFields = getStaffVisibleFields(app.state);
   const result: Record<string, unknown> = {};
 
-  for (const field of fields) {
+  for (const field of visibleFields) {
     if (field === "correctionFields") {
       const active = corrections.filter((c) => !c.resolved);
       result[field] = active.flatMap((c) => c.fields);
@@ -21,7 +24,7 @@ function projectToStaffView(
     }
   }
 
-  return result;
+  return { ...result, view };
 }
 
 export async function GET() {
@@ -35,20 +38,16 @@ export async function GET() {
     orderBy: { createdAt: "desc" },
   });
 
-  const result = apps.map((app) => {
-    const serialized = serializeApplication(app);
-    const appCorrections = allCorrections
-      .filter((c) => c.applicationId === app.id)
-      .map(serializeCorrection);
+  const result = apps
+    .map((app) => {
+      const serialized = serializeApplication(app);
+      const appCorrections = allCorrections
+        .filter((c) => c.applicationId === app.id)
+        .map(serializeCorrection);
 
-    const view: StaffViewType =
-      app.state === "NEEDS_CORRECTION" ? "CORRECTION_REVIEW" : "INTAKE_REVIEW";
-
-    return {
-      ...projectToStaffView(serialized, view, appCorrections),
-      view,
-    };
-  });
+      return projectToStaffView(serialized, appCorrections);
+    })
+    .filter((r): r is NonNullable<typeof r> => r !== null);
 
   return apiSuccess(result);
 }

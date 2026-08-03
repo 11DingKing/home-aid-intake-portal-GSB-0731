@@ -6,6 +6,8 @@ import { correctionCreateSchema } from "@/domain/validation";
 import { assertTransition } from "@/domain/state-machine";
 import { saveSnapshot, getBaseForMerge } from "@/lib/snapshots";
 import { diffChangedFields, CLIENT_EDITABLE_FIELDS } from "@/domain/conflict";
+import { writeAuditLog, logRejectedFields, logInvalidTransition } from "@/lib/audit";
+import { validateStaffMutation, getStaleLinkState } from "@/domain/field-permissions";
 
 interface RouteContext {
   params: { id: string };
@@ -24,13 +26,23 @@ export async function POST(request: NextRequest, { params }: RouteContext) {
     const app = await prisma.application.findUnique({ where: { id: params.id } });
     if (!app) return apiError("申请不存在", 404);
 
-    if (app.state !== "SUBMITTED" && app.state !== "RESUBMITTED") {
-      return apiError(`当前状态 ${app.state} 不允许发起补正`, 403, undefined, {
-        currentState: app.state,
+    const raw = (await request.json()) as Record<string, unknown>;
+
+    const fieldValidation = validateStaffMutation(raw, app.state as never, "correction");
+    if (fieldValidation.rejectedFields.length > 0) {
+      await logRejectedFields(
+        params.id,
+        "STAFF",
+        fieldValidation.rejectedFields,
+        fieldValidation.reasons,
+        app.state
+      );
+      return apiError("包含不允许的字段", 403, undefined, {
+        rejectedFields: fieldValidation.rejectedFields,
+        reasons: fieldValidation.reasons,
       });
     }
 
-    const raw = await request.json();
     const parsed = correctionCreateSchema.safeParse(raw);
     if (!parsed.success) {
       const errors = parsed.error.issues.map((i) => ({
@@ -38,6 +50,19 @@ export async function POST(request: NextRequest, { params }: RouteContext) {
         message: i.message,
       }));
       return apiError("数据校验失败", 422, errors);
+    }
+
+    if (app.state !== "SUBMITTED" && app.state !== "RESUBMITTED") {
+      await logInvalidTransition(
+        params.id,
+        "STAFF",
+        app.state,
+        "NEEDS_CORRECTION",
+        `Correction not allowed in state ${app.state}`
+      );
+      return apiError(`当前状态 ${app.state} 不允许发起补正`, 403, undefined, {
+        currentState: app.state,
+      });
     }
 
     const { fields, reasonCode, version } = parsed.data;
@@ -52,7 +77,17 @@ export async function POST(request: NextRequest, { params }: RouteContext) {
         CLIENT_EDITABLE_FIELDS as readonly string[]
       );
 
-      return apiConflict("申请数据已被申请人修改，请刷新后重试", {
+      const staleInfo = getStaleLinkState("SUBMITTED", app.state as never);
+
+      await writeAuditLog({
+        applicationId: params.id,
+        action: "STALE_LINK_DETECTED",
+        fromState: app.state,
+        actor: "STAFF",
+        details: { staffVersion: version, serverVersion: app.version, changedFields },
+      });
+
+      return apiConflict("申请数据已被修改，请刷新后重试", {
         serverData: serverApp,
         conflicts: changedFields,
         serverVersion: app.version,
@@ -60,6 +95,7 @@ export async function POST(request: NextRequest, { params }: RouteContext) {
         serverWins: changedFields,
         applicantWins: [],
         autoMerged: [],
+        staleLink: staleInfo.isStale ? { message: staleInfo.message } : undefined,
       });
     }
 
@@ -95,15 +131,13 @@ export async function POST(request: NextRequest, { params }: RouteContext) {
 
     await saveSnapshot(updated, "STAFF");
 
-    await prisma.auditLog.create({
-      data: {
-        applicationId: params.id,
-        action: "CORRECTION_REQUESTED",
-        fromState: app.state,
-        toState: "NEEDS_CORRECTION",
-        actor: "STAFF",
-        details: JSON.stringify({ fields, reasonCode, staffBaseVersion: version ?? null }),
-      },
+    await writeAuditLog({
+      applicationId: params.id,
+      action: "CORRECTION_REQUESTED",
+      fromState: app.state,
+      toState: "NEEDS_CORRECTION",
+      actor: "STAFF",
+      details: { fields, reasonCode, staffBaseVersion: version ?? null, rejectionReason: reasonCode },
     });
 
     return apiSuccess(serializeCorrection(correction), 201);

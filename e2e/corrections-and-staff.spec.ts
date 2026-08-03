@@ -108,8 +108,28 @@ test.describe("Staff minimal disclosure", () => {
     expect(content).not.toContain("案件描述");
   });
 
-  test("intake review view shows minimal fields", async ({ page }) => {
-    await page.goto("/staff/APP-201");
+  test("intake review view shows minimal fields", async ({ page, request }) => {
+    const appId = `E2E-INTAKE-${Date.now()}`;
+    await request.post("/api/applications", { data: { id: appId } });
+    let app = await (await request.get(`/api/applications/${appId}`)).json();
+    await request.put(`/api/applications/${appId}`, {
+      data: {
+        fullName: "审核测试",
+        contactPhone: "13800138000",
+        caseDescription: "这是用于测试工作人员收件审核视图的案件描述内容",
+        legalIssueType: "HOUSING",
+        exemptionReason: "NONE",
+        idDocumentMeta: { materialId: "ID-1", fileName: "id.pdf", mimeType: "application/pdf", sizeBytes: 1024, uploadedAt: new Date().toISOString(), status: "UPLOADED" },
+        otherMaterialMeta: { materialId: "O-1", fileName: "o.pdf", mimeType: "application/pdf", sizeBytes: 1024, uploadedAt: new Date().toISOString(), status: "UPLOADED" },
+        economicProofMeta: { materialId: "E-1", fileName: "e.pdf", mimeType: "application/pdf", sizeBytes: 1024, uploadedAt: new Date().toISOString(), status: "UPLOADED" },
+        version: app.data.version,
+      },
+    });
+    await request.post(`/api/applications/${appId}/submit`, {
+      data: { idempotencyKey: `intake-${Date.now()}` },
+    });
+
+    await page.goto(`/staff/${appId}`);
     await page.waitForTimeout(2000);
 
     const content = await page.locator("main").textContent();

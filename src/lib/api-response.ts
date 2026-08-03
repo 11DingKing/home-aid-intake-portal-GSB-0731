@@ -25,6 +25,7 @@ export interface ConflictDetail {
   serverWins?: string[];
   autoMerged?: string[];
   changedByOther?: string[];
+  staleLink?: { message: string };
 }
 
 export function apiConflict(

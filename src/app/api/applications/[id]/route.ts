@@ -11,6 +11,8 @@ import {
 } from "@/domain/conflict";
 import { isEditableState } from "@/domain/state-machine";
 import { saveSnapshot, getBaseForMerge } from "@/lib/snapshots";
+import { writeAuditLog, logRejectedFields } from "@/lib/audit";
+import { validateClientMutation } from "@/domain/field-permissions";
 import { PROTECTED_FIELDS } from "@/domain/types";
 import type { ExemptionReason } from "@/domain/types";
 
@@ -80,10 +82,33 @@ export async function PUT(request: NextRequest, { params }: RouteContext) {
     if (!app) return apiError("申请不存在", 404);
 
     if (!isEditableState(app.state as never)) {
+      await writeAuditLog({
+        applicationId: params.id,
+        action: "INVALID_TRANSITION_REJECTED",
+        fromState: app.state,
+        actor: "APPLICANT",
+        details: { reason: `Attempted edit in non-editable state ${app.state}` },
+      });
       return apiError(`当前状态 ${app.state} 不允许编辑`, 403);
     }
 
-    const raw = await request.json();
+    const raw = (await request.json()) as Record<string, unknown>;
+
+    const fieldValidation = validateClientMutation(raw, app.state as never);
+    if (fieldValidation.rejectedFields.length > 0) {
+      await logRejectedFields(
+        params.id,
+        "APPLICANT",
+        fieldValidation.rejectedFields,
+        fieldValidation.reasons,
+        app.state
+      );
+      return apiError("包含不允许修改的字段", 403, undefined, {
+        rejectedFields: fieldValidation.rejectedFields,
+        reasons: fieldValidation.reasons,
+      });
+    }
+
     const parsed = draftUpdateSchema.safeParse(raw);
     if (!parsed.success) {
       const errors = parsed.error.issues.map((i) => ({
@@ -130,18 +155,16 @@ export async function PUT(request: NextRequest, { params }: RouteContext) {
           data: updateData,
         });
         await saveSnapshot(updated, "APPLICANT");
-        await prisma.auditLog.create({
-          data: {
-            applicationId: params.id,
-            action: "DRAFT_MERGED",
-            fromState: app.state,
-            toState: updated.state,
-            actor: "APPLICANT",
-            details: JSON.stringify({
-              conflicts: result.conflicts,
-              autoMerged: result.autoMerged,
-              serverWins: result.serverWins,
-            }),
+        await writeAuditLog({
+          applicationId: params.id,
+          action: "DRAFT_MERGED",
+          fromState: app.state,
+          toState: updated.state,
+          actor: "APPLICANT",
+          details: {
+            conflicts: result.conflicts,
+            autoMerged: result.autoMerged,
+            serverWins: result.serverWins,
           },
         });
         return apiSuccess(serializeApplication(updated));
@@ -159,6 +182,14 @@ export async function PUT(request: NextRequest, { params }: RouteContext) {
     });
 
     await saveSnapshot(updated, "APPLICANT");
+    await writeAuditLog({
+      applicationId: params.id,
+      action: "DRAFT_SAVED",
+      fromState: app.state,
+      toState: updated.state,
+      actor: "APPLICANT",
+      details: { fields: Object.keys(sanitizedClient) },
+    });
 
     return apiSuccess(serializeApplication(updated));
   } catch (err) {
