@@ -4,6 +4,7 @@ import { serializeApplication } from "@/lib/serializers";
 import { apiSuccess, apiError } from "@/lib/api-response";
 import { staffDecisionSchema } from "@/domain/validation";
 import { assertTransition } from "@/domain/state-machine";
+import { saveSnapshot } from "@/lib/snapshots";
 
 interface RouteContext {
   params: { id: string };
@@ -31,6 +32,8 @@ export async function POST(request: NextRequest, { params }: RouteContext) {
       where: { id: params.id },
       data: { state: action, version: app.version + 1 },
     });
+
+    await saveSnapshot(updated, "STAFF");
 
     await prisma.auditLog.create({
       data: {

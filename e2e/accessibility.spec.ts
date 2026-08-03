@@ -1,6 +1,8 @@
 import { test, expect, type Page } from "@playwright/test";
 
-const TEST_APP_ID = `E2E-ACCESS-${Date.now()}`;
+function makeTestAppId() {
+  return `E2E-ACCESS-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+}
 
 async function goToStep(page: Page, stepIndex: number) {
   for (let i = 0; i < stepIndex; i++) {
@@ -14,9 +16,12 @@ async function goToStep(page: Page, stepIndex: number) {
 }
 
 test.describe("Accessibility - keyboard navigation and screen reader", () => {
+  let testAppId: string;
+
   test.beforeEach(async ({ page }) => {
-    await page.goto(`/apply/${TEST_APP_ID}`);
-    await page.waitForTimeout(1000);
+    testAppId = makeTestAppId();
+    await page.goto(`/apply/${testAppId}`);
+    await page.waitForTimeout(1500);
   });
 
   test("all form controls have programmatic names", async ({ page }) => {
@@ -88,7 +93,7 @@ test.describe("Accessibility - keyboard navigation and screen reader", () => {
   });
 
   test("can complete entire form using only keyboard", async ({ page }) => {
-    await page.keyboard.press("Tab");
+    await page.locator("#fullName").focus();
     await page.keyboard.type("键盘测试用户");
     await page.keyboard.press("Tab");
     await page.keyboard.type("13900139000");
@@ -102,33 +107,43 @@ test.describe("Accessibility - keyboard navigation and screen reader", () => {
     focused = await page.evaluate(() => document.activeElement?.textContent);
     expect(focused).toContain("下一步");
     await page.keyboard.press("Enter");
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(500);
 
-    await page.keyboard.press("Tab");
-    await page.keyboard.press("Space");
-    await page.waitForTimeout(100);
-    await page.keyboard.press("Tab");
+    await expect(page.locator("#step-heading")).toContainText("案件信息");
+
+    await page.locator("#legalIssueType").focus();
+    await page.locator("#legalIssueType").selectOption("HOUSING");
+    await page.locator("#caseDescription").focus();
     await page.keyboard.type("这是一个通过键盘填写的案件描述内容");
+
+    await page.keyboard.press("Tab");
     await page.keyboard.press("Tab");
     focused = await page.evaluate(() => document.activeElement?.textContent);
     expect(focused).toContain("下一步");
     await page.keyboard.press("Enter");
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(500);
+
+    await expect(page.locator("#step-heading")).toContainText("资格与豁免");
+
+    const firstRadio = page.locator('input[name="exemptionReason"]').first();
+    await firstRadio.focus();
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("ArrowDown");
+    await page.waitForTimeout(200);
 
     await page.keyboard.press("Tab");
-    await page.keyboard.press("ArrowDown");
-    await page.keyboard.press("ArrowDown");
-    await page.keyboard.press("Enter");
-    await page.waitForTimeout(300);
-
     await page.keyboard.press("Tab");
     focused = await page.evaluate(() => document.activeElement?.textContent);
     expect(focused).toContain("下一步");
     await page.keyboard.press("Enter");
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(500);
 
-    const stepText = await page.locator("#step-heading").textContent();
-    expect(stepText).toContain("合理便利");
+    await expect(page.locator("#step-heading")).toContainText("合理便利");
+
+    const checkbox = page.locator("#accommodations-HOME_VISIT_NEEDED");
+    await checkbox.focus();
+    await page.keyboard.press("Space");
+    await expect(checkbox).toBeChecked();
   });
 
   test("ARIA live region announces step changes", async ({ page }) => {

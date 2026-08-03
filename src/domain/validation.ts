@@ -46,11 +46,13 @@ export type DraftUpdateInput = z.infer<typeof draftUpdateSchema>;
 
 export const submitSchema = z.object({
   idempotencyKey: z.string().min(1),
+  version: z.number().int().positive().optional(),
 });
 
 export const correctionCreateSchema = z.object({
   fields: z.array(z.string().min(1)).min(1, "请至少选择一个需要补正的字段"),
   reasonCode: z.enum(CORRECTION_REASON_CODES),
+  version: z.number().int().positive().optional(),
 });
 
 export const staffDecisionSchema = z.object({

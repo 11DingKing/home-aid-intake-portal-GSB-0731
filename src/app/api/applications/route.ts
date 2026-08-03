@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { serializeApplication } from "@/lib/serializers";
 import { apiSuccess, apiError } from "@/lib/api-response";
+import { saveSnapshot } from "@/lib/snapshots";
 
 export async function GET() {
   const apps = await prisma.application.findMany({
@@ -23,6 +24,8 @@ export async function POST(request: NextRequest) {
     const app = await prisma.application.create({
       data: { id, state: "DRAFT", accommodations: "[]" },
     });
+
+    await saveSnapshot(app, "APPLICANT");
 
     await prisma.auditLog.create({
       data: {

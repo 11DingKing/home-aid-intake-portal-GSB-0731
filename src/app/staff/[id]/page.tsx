@@ -115,7 +115,7 @@ export default function StaffDetailPage({ params }: { params: { id: string } }) 
     const res = await fetch(`/api/applications/${params.id}/corrections`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fields: selectedFields, reasonCode }),
+      body: JSON.stringify({ fields: selectedFields, reasonCode, version: app?.version }),
     });
     if (res.ok) {
       setAnnouncement("补正请求已发送，申请人将被通知");
@@ -123,6 +123,14 @@ export default function StaffDetailPage({ params }: { params: { id: string } }) 
       setSelectedFields([]);
       await loadData();
       router.refresh();
+    } else if (res.status === 409) {
+      const json = await res.json().catch(() => ({}));
+      const changedFields = (json.conflicts as string[]) || [];
+      setError(
+        `申请数据已被申请人修改（${changedFields.join("、") || "未知字段"}），请刷新页面后重试。`
+      );
+      setAnnouncement("检测到并发修改冲突");
+      await loadData();
     } else {
       const json = await res.json().catch(() => ({}));
       setError(json.error || "操作失败");

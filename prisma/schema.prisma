@@ -27,6 +27,7 @@ model Application {
   submittedAt       DateTime?
   corrections       Correction[]
   auditLogs         AuditLog[]
+  snapshots         ApplicationSnapshot[]
 
   @@index([state])
 }
@@ -52,4 +53,18 @@ model AuditLog {
   actor         String   @default("SYSTEM")
   details       String?
   createdAt     DateTime @default(now())
+}
+
+model ApplicationSnapshot {
+  id            Int      @id @default(autoincrement())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  version       Int
+  state         String
+  data          String
+  actor         String   @default("SYSTEM")
+  createdAt     DateTime @default(now())
+
+  @@unique([applicationId, version])
+  @@index([applicationId])
 }

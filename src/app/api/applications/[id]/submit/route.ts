@@ -1,9 +1,11 @@
 import { NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { serializeApplication } from "@/lib/serializers";
-import { apiSuccess, apiError } from "@/lib/api-response";
+import { apiSuccess, apiError, apiConflict } from "@/lib/api-response";
 import { submitSchema, validateForSubmission } from "@/domain/validation";
 import { assertTransition } from "@/domain/state-machine";
+import { saveSnapshot, getBaseForMerge } from "@/lib/snapshots";
+import { diffChangedFields, CLIENT_EDITABLE_FIELDS } from "@/domain/conflict";
 import type { ExemptionReason } from "@/domain/types";
 
 interface RouteContext {
@@ -21,7 +23,7 @@ export async function POST(request: NextRequest, { params }: RouteContext) {
       return apiError("缺少幂等键", 400);
     }
 
-    const { idempotencyKey } = parsed.data;
+    const { idempotencyKey, version } = parsed.data;
 
     if (app.idempotencyKey === idempotencyKey) {
       return apiSuccess(serializeApplication(app));
@@ -32,7 +34,30 @@ export async function POST(request: NextRequest, { params }: RouteContext) {
     }
 
     if (app.state !== "DRAFT" && app.state !== "NEEDS_CORRECTION") {
-      return apiError(`当前状态 ${app.state} 不允许提交`, 403);
+      return apiError(`当前状态 ${app.state} 不允许提交`, 403, undefined, {
+        currentState: app.state,
+      });
+    }
+
+    if (version !== undefined && version < app.version) {
+      const baseData = await getBaseForMerge(params.id, version, app);
+      const serverApp = serializeApplication(app);
+      const serverData = serverApp as unknown as Record<string, unknown>;
+      const changedFields = diffChangedFields(
+        baseData,
+        serverData,
+        CLIENT_EDITABLE_FIELDS as readonly string[]
+      );
+
+      return apiConflict("申请数据已被修改，请刷新后查看最新状态再提交", {
+        serverData: serverApp,
+        conflicts: changedFields,
+        serverVersion: app.version,
+        changedByOther: changedFields,
+        serverWins: changedFields,
+        applicantWins: [],
+        autoMerged: [],
+      });
     }
 
     const validation = validateForSubmission({
@@ -64,6 +89,8 @@ export async function POST(request: NextRequest, { params }: RouteContext) {
       },
     });
 
+    await saveSnapshot(updated, "APPLICANT");
+
     await prisma.auditLog.create({
       data: {
         applicationId: params.id,
@@ -71,7 +98,7 @@ export async function POST(request: NextRequest, { params }: RouteContext) {
         fromState: app.state,
         toState: targetState,
         actor: "APPLICANT",
-        details: JSON.stringify({ idempotencyKey }),
+        details: JSON.stringify({ idempotencyKey, clientVersion: version ?? null }),
       },
     });
 

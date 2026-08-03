@@ -17,20 +17,43 @@ export function apiError(
   );
 }
 
+export interface ConflictDetail {
+  serverData: unknown;
+  conflicts: string[];
+  serverVersion: number;
+  applicantWins?: string[];
+  serverWins?: string[];
+  autoMerged?: string[];
+  changedByOther?: string[];
+}
+
 export function apiConflict(
   message: string,
-  serverData: unknown,
-  conflicts: string[],
-  serverVersion: number
+  detail: ConflictDetail
 ) {
   return NextResponse.json(
     {
       success: false,
       error: message,
       code: "VERSION_CONFLICT",
-      serverData,
-      conflicts,
-      serverVersion,
+      ...detail,
+    },
+    { status: 409 }
+  );
+}
+
+export function apiStateConflict(
+  message: string,
+  currentState: string,
+  extra?: Record<string, unknown>
+) {
+  return NextResponse.json(
+    {
+      success: false,
+      error: message,
+      code: "STATE_CONFLICT",
+      currentState,
+      ...extra,
     },
     { status: 409 }
   );

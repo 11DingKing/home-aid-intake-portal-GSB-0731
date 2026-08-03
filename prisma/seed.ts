@@ -39,7 +39,7 @@ async function main() {
       await prisma.application.delete({ where: { id: app.id } });
     }
 
-    await prisma.application.create({
+    const created = await prisma.application.create({
       data: {
         id: app.id,
         state: "DRAFT",
@@ -61,16 +61,55 @@ async function main() {
         version: 1,
       },
     });
+
+    await prisma.applicationSnapshot.create({
+      data: {
+        applicationId: created.id,
+        version: created.version,
+        state: created.state,
+        data: JSON.stringify({
+          id: created.id,
+          state: created.state,
+          exemptionReason: created.exemptionReason,
+          fullName: created.fullName,
+          contactPhone: created.contactPhone,
+          contactEmail: created.contactEmail,
+          caseDescription: created.caseDescription,
+          legalIssueType: created.legalIssueType,
+          accommodations: app.accommodations,
+          economicProofMeta: created.economicProofMeta ? JSON.parse(created.economicProofMeta) : null,
+          idDocumentMeta: created.idDocumentMeta ? JSON.parse(created.idDocumentMeta) : null,
+          otherMaterialMeta: created.otherMaterialMeta ? JSON.parse(created.otherMaterialMeta) : null,
+          version: created.version,
+        }),
+        actor: "SEED",
+      },
+    });
   }
 
   for (const corr of data.corrections) {
     const app = await prisma.application.findUnique({ where: { id: corr.applicationId } });
     if (!app) continue;
 
+    let updated = app;
     if (app.state === "DRAFT") {
-      await prisma.application.update({
+      updated = await prisma.application.update({
         where: { id: corr.applicationId },
         data: { state: "NEEDS_CORRECTION", version: app.version + 1 },
+      });
+
+      await prisma.applicationSnapshot.create({
+        data: {
+          applicationId: updated.id,
+          version: updated.version,
+          state: updated.state,
+          data: JSON.stringify({
+            id: updated.id,
+            state: updated.state,
+            version: updated.version,
+          }),
+          actor: "SEED",
+        },
       });
     }
 

@@ -74,11 +74,22 @@ test.describe("Correction and resubmission flow", () => {
     await page.goto("/apply/APP-201");
     await page.waitForTimeout(2000);
 
-    const economicField = page.locator("#economicProofMeta");
-    const isDisabled = await economicField.evaluate((el) => {
-      const upload = el.closest(".material-upload");
-      return upload?.getAttribute("aria-disabled") || upload?.querySelector("input[disabled]") !== null;
+    for (let i = 0; i < 4; i++) {
+      const nextBtn = page.getByRole("button", { name: "下一步" });
+      if (await nextBtn.isVisible()) {
+        await nextBtn.click();
+        await page.waitForTimeout(400);
+      }
+    }
+
+    const stepHeading = page.locator("#step-heading");
+    await expect(stepHeading).toContainText("材料上传");
+
+    const economicInput = page.locator("#economicProofMeta");
+    const isDisabled = await economicInput.evaluate((el) => {
+      return el.hasAttribute("disabled");
     });
+    expect(isDisabled).toBe(true);
 
     const materialsSection = page.locator("#form-panel");
     const text = await materialsSection.textContent();

@@ -72,6 +72,7 @@ export function ApplicationForm({ applicationId }: ApplicationFormProps) {
     isSaving,
     saveMessage,
     conflictMessage,
+    conflictFields,
     loadApplication,
   } = useDraft(applicationId);
 
@@ -253,7 +254,37 @@ export function ApplicationForm({ applicationId }: ApplicationFormProps) {
         </div>
         {draft.state === "NEEDS_CORRECTION" && (
           <div className="alert alert-warning" style={{ marginTop: "12px" }} role="alert">
-            工作人员要求您补正材料。请检查各步骤后重新提交。
+            <strong>工作人员要求您补正材料。</strong>
+            {draft.activeCorrections.length > 0 && (
+              <ul style={{ marginTop: "8px", marginBottom: 0 }}>
+                {draft.activeCorrections.map((c, i) => (
+                  <li key={i}>
+                    需补正字段：{c.fields.join("、")}（原因：{c.reasonCode}）
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p style={{ marginBottom: 0, marginTop: "8px" }}>请检查各步骤后重新提交。</p>
+          </div>
+        )}
+        {conflictFields.length > 0 && (
+          <div className="alert alert-info" style={{ marginTop: "12px" }} role="status">
+            <strong>冲突字段：</strong>
+            {conflictFields.map((f) => (
+              <span
+                key={f}
+                style={{
+                  display: "inline-block",
+                  padding: "2px 8px",
+                  margin: "2px",
+                  background: "var(--color-bg)",
+                  borderRadius: "3px",
+                  fontSize: "0.8125rem",
+                }}
+              >
+                {f}
+              </span>
+            ))}
           </div>
         )}
         {saveMessage && (
